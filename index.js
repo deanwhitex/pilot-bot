@@ -44,7 +44,7 @@ client.on("messageCreate", async (message) => {
    message.reply({
   content: response,
   flags: ["SuppressEmbeds"]
-});
+})
   } catch (err) {
     console.error("Bot error:", err);
     message.reply("Sorry Dean, something went wrong. 😕");
@@ -95,8 +95,10 @@ function initSchedulers() {
         if (events.length >= 6) {
           msg += `\n⚠️ *Heads up:* Today is extremely full. Consider blocking rest time.\n`;
         }
-
-        channel.send(msg);
+      channel.send({
+  content: msg,
+  flags: ["SuppressEmbeds"]
+})
       } catch (err) {
         console.error("Daily summary error:", err);
       }
