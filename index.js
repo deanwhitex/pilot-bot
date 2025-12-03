@@ -7,40 +7,59 @@ import { getEventsForDate, getEventsForRange } from "./calendar.js";
 import OpenAI from "openai";
 
 const TIMEZONE = "Africa/Windhoek";
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-/* ----------------------------------------------------------
-   DISCORD CLIENT
----------------------------------------------------------- */
+// ----------------------------------------------------------
+// SAFETY: Prevent duplicate bot processes (Render bug fix)
+// ----------------------------------------------------------
+if (global.pilotBotAlreadyStarted) {
+  console.log("⚠️ Bot instance already running — skipping duplicate startup.");
+  return;
+}
+global.pilotBotAlreadyStarted = true;
+
+// ----------------------------------------------------------
+// OPENAI CLIENT
+// ----------------------------------------------------------
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
+
+// ----------------------------------------------------------
+// DISCORD CLIENT
+// ----------------------------------------------------------
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent,
+    GatewayIntentBits.MessageContent
   ],
   partials: [Partials.Channel],
 });
 
 client.once("ready", () => {
-  console.log(`Dean Pilot is online as ${client.user.tag}`);
+  console.log(`🚀 Dean Pilot is online as ${client.user.tag}`);
   initSchedulers();
 });
 
-/* ----------------------------------------------------------
-   MESSAGE HANDLER — BOT REPLIES ONLY WHEN MENTIONED
----------------------------------------------------------- */
+// ----------------------------------------------------------
+// MESSAGE HANDLER — reply ONLY when mentioned
+// ----------------------------------------------------------
 client.on("messageCreate", async (message) => {
   if (message.author.bot) return;
+
+  // prevent duplicate handling inside the same process
+  if (message._handledByPilot) return;
+  message._handledByPilot = true;
+
   if (!message.mentions.has(client.user)) return;
 
-  // Remove @mention from message
+  // Clean message (remove @mention)
   const clean = message.content.replace(/<@!?\\d+>/g, "").trim();
 
-  // If user only tagged the bot
   if (!clean) {
     return message.reply({
       content: "Hey Dean! How can I help with your schedule? 😊",
-      flags: ["SuppressEmbeds"],
+      flags: ["SuppressEmbeds"]
     });
   }
 
@@ -49,32 +68,27 @@ client.on("messageCreate", async (message) => {
 
     return message.reply({
       content: response,
-      flags: ["SuppressEmbeds"],
+      flags: ["SuppressEmbeds"] // stop showing Zoom preview
     });
 
   } catch (err) {
     console.error("Bot error:", err);
-    return message.reply({
-      content: "Sorry Dean, something went wrong. 😕",
-      flags: ["SuppressEmbeds"],
-    });
+    return message.reply("Sorry Dean, something went wrong. 😕");
   }
 });
 
-/* ----------------------------------------------------------
-   SCHEDULERS (Daily + Weekly)
----------------------------------------------------------- */
+// ----------------------------------------------------------
+// SCHEDULERS — Daily & Weekly Summaries
+// ----------------------------------------------------------
 function initSchedulers() {
   const channelId = process.env.DAILY_CHANNEL_ID;
 
   if (!channelId) {
-    console.error("❌ DAILY_CHANNEL_ID missing in .env");
+    console.error("❌ DAILY_CHANNEL_ID missing inside .env");
     return;
   }
 
-  /* -----------------------------------------------
-     🕖 DAILY SUMMARY — 7AM EVERY DAY
-  ----------------------------------------------- */
+  // 🕖 DAILY SUMMARY — 07:00 every day
   cron.schedule(
     "0 7 * * *",
     async () => {
@@ -92,10 +106,12 @@ function initSchedulers() {
         if (events.length === 0) {
           msg += "You’re completely free today! 😎\n";
         } else {
+          let i = 1;
           for (const ev of events) {
-            msg += `• **${ev.summary}** — ${formatTime(
-              ev.start.dateTime
-            )} to ${formatTime(ev.end.dateTime)}\n`;
+            msg += `${i}. **${ev.summary}** — ${formatTime(ev.start.dateTime)} to ${formatTime(
+              ev.end.dateTime
+            )}\n`;
+            i++;
           }
         }
 
@@ -107,7 +123,7 @@ function initSchedulers() {
 
         return channel.send({
           content: msg,
-          flags: ["SuppressEmbeds"],
+          flags: ["SuppressEmbeds"]
         });
 
       } catch (err) {
@@ -117,9 +133,7 @@ function initSchedulers() {
     { timezone: TIMEZONE }
   );
 
-  /* -----------------------------------------------
-     📅 WEEKLY SUMMARY — EVERY MONDAY AT 07:00
-  ----------------------------------------------- */
+  // 📅 WEEKLY SUMMARY — Mondays @ 07:00
   cron.schedule(
     "0 7 * * MON",
     async () => {
@@ -148,7 +162,7 @@ function initSchedulers() {
 
         return channel.send({
           content: msg,
-          flags: ["SuppressEmbeds"],
+          flags: ["SuppressEmbeds"]
         });
 
       } catch (err) {
@@ -159,9 +173,9 @@ function initSchedulers() {
   );
 }
 
-/* ----------------------------------------------------------
-   AI DAILY PRIORITY LIST
----------------------------------------------------------- */
+// ----------------------------------------------------------
+// AI PRIORITY LIST
+// ----------------------------------------------------------
 async function generateDailyPriorities(events) {
   if (events.length === 0) return "\n📌 No tasks today.\n";
 
@@ -169,13 +183,13 @@ async function generateDailyPriorities(events) {
     const tasks = events.map((e) => e.summary).join(", ");
 
     const prompt = `
-You are Dean's friendly scheduling assistant.
+You are Dean's friendly assistant.
 
-Here are today's events:
+Today's events:
 ${tasks}
 
-Write a short, friendly list of **top priorities** for him today.
-Keep it positive, short, and supportive.
+Write a short list of **key priorities**.
+Tone: friendly, helpful, motivating.
 `;
 
     const completion = await openai.chat.completions.create({
@@ -191,9 +205,9 @@ Keep it positive, short, and supportive.
   }
 }
 
-/* ----------------------------------------------------------
-   Formatting Helpers
----------------------------------------------------------- */
+// ----------------------------------------------------------
+// TIME HELPERS
+// ----------------------------------------------------------
 function formatDate(date) {
   return new Date(date).toLocaleDateString("en-ZA", { timeZone: TIMEZONE });
 }
@@ -202,11 +216,12 @@ function formatTime(date) {
   return new Date(date).toLocaleTimeString("en-ZA", {
     hour: "2-digit",
     minute: "2-digit",
-    timeZone: TIMEZONE,
+    timeZone: TIMEZONE
   });
 }
 
-/* ----------------------------------------------------------
-   LOGIN
----------------------------------------------------------- */
+// ----------------------------------------------------------
+// LOGIN
+// ----------------------------------------------------------
 client.login(process.env.DISCORD_TOKEN);
+
