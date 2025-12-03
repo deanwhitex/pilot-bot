@@ -11,9 +11,10 @@
     "node": "18.20.2"
   },
  "dependencies": {
-    "discord.js": "^14.12.1",
-    "googleapis": "^105.0.0",
-    "openai": "^4.0.0",
+    "discord.js": "^14.13.0",
+    "googleapis": "^131.0.0",
+    "openai": "^4.23.0",
+    "node-cron": "^3.0.2"
     "node-schedule": "^2.1.1",
     "axios": "^1.6.0",
     "ffmpeg-static": "^5.2.0",
