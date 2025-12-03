@@ -7,16 +7,13 @@ import {
   createEvent,
 } from "./calendar.js";
 
-// OpenAI client
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// Human scheduling window
-const MIN_HOUR = 8;   // 08:00
-const MAX_HOUR = 22;  // 22:00
+// HUMAN SCHEDULING RULES
+const MIN_HOUR = 8;
+const MAX_HOUR = 22;
 const DEFAULT_DURATION_MIN = 60;
-const TIMEZONE = "Africa/Johannesburg";
+const TIMEZONE = "Africa/Windhoek";   // RESTORED — correct timezone
 
 /* ----------------------------------------------------------
    INTENT ENGINE — Converts human text to structured JSON
@@ -25,7 +22,7 @@ async function interpretMessage(message) {
   const prompt = `
 You are Dean’s expert AI scheduling assistant.
 
-Convert his natural language request into STRICT JSON:
+Return STRICT JSON ONLY:
 
 {
   "intent": "",
@@ -38,35 +35,45 @@ Convert his natural language request into STRICT JSON:
   "end_time": ""
 }
 
-RULES:
-- “Add”, “Book”, “Schedule”, “Put”, “Make” → intent = "create_event"
-- “What's on”, “What do I have”, “My schedule” → intent = "day_summary"
-- “Week”, “Month”, “Next week”, “Between” → intent = "range_summary"
-- “Find free time”, “Open slot”, “When can I” → intent = "find_free_time"
-- Default duration = 60 minutes
-- Convert human dates (“tomorrow”, “next Friday”) to ISO only if possible
-- If the user does NOT specify a time for event creation:
-    → leave start_time blank
-    → your assistant logic will suggest three human-friendly options
-- Humans do NOT want events before 08:00 or after 22:00
-- Ensure JSON is valid, no trailing commas, no commentary.
-- NEVER return text outside the JSON.
-
-USER INPUT:
+Rules:
+- “add/book/schedule/put/make” → create_event
+- “what's on / what do I have / schedule” → day_summary
+- week/month/between → range_summary
+- free time/open slot → find_free_time
+- default duration = 60
+- convert "tomorrow", "next friday" to ISO if possible
+- if unsure, leave fields blank (I will handle them)
+- NEVER output anything except the JSON object
+USER MESSAGE:
 "${message}"
-  `;
+`;
 
-  const completion = await openai.chat.completions.create({
+  const reply = await openai.chat.completions.create({
     model: "gpt-4o-mini",
     messages: [{ role: "user", content: prompt }],
     temperature: 0,
   });
 
   try {
-    return JSON.parse(completion.choices[0].message.content);
+    const parsed = JSON.parse(reply.choices[0].message.content);
+
+    // Fix: Interpret "tomorrow"
+    if (!parsed.date && message.toLowerCase().includes("tomorrow")) {
+      parsed.date = getTomorrowISO();
+    }
+
+    return parsed;
+
   } catch {
     return { intent: "unknown" };
   }
+}
+
+/* Tomorrow helper */
+function getTomorrowISO() {
+  const d = new Date();
+  d.setDate(d.getDate() + 1);
+  return d.toISOString().split("T")[0];
 }
 
 /* ----------------------------------------------------------
@@ -80,10 +87,7 @@ export async function handleUserMessage(message) {
       return await handleDaySummary(intent.date);
 
     case "range_summary":
-      return await handleRangeSummary(
-        intent.range_start,
-        intent.range_end
-      );
+      return await handleRangeSummary(intent.range_start, intent.range_end);
 
     case "find_free_time":
       return await handleFindFree(intent);
@@ -100,9 +104,12 @@ export async function handleUserMessage(message) {
    DAY SUMMARY
 ---------------------------------------------------------- */
 async function handleDaySummary(date) {
-  if (!date) return "Which date would you like me to check? 😊";
+  if (!date) return "Which date should I check? 😊";
 
-  const events = await getEventsForDate(new Date(date));
+  // FIX: Force correct local interpretation
+  const day = new Date(`${date}T00:00:00`);
+
+  const events = await getEventsForDate(day);
 
   if (events.length === 0) {
     return `Your schedule is *wide open* on **${formatDate(date)}** 😎`;
@@ -111,24 +118,22 @@ async function handleDaySummary(date) {
   let out = `📅 **Your schedule for ${formatDate(date)}:**\n\n`;
 
   for (const ev of events) {
-    out += `• **${ev.summary}** — ${formatTime(ev.start.dateTime)} to ${formatTime(
-      ev.end.dateTime
-    )}\n`;
+    out += `• **${ev.summary}** — ${formatTime(ev.start.dateTime)} to ${formatTime(ev.end.dateTime)}\n`;
   }
 
   return out;
 }
 
 /* ----------------------------------------------------------
-   WEEK / MONTH RANGE SUMMARY
+   RANGE SUMMARY
 ---------------------------------------------------------- */
 async function handleRangeSummary(start, end) {
   if (!start || !end)
-    return "Which date range would you like me to check?";
+    return "Which date range should I check?";
 
   const events = await getEventsForRange(
-    new Date(start),
-    new Date(end)
+    new Date(`${start}T00:00:00`),
+    new Date(`${end}T23:59:00`)
   );
 
   if (events.length === 0) {
@@ -138,24 +143,23 @@ async function handleRangeSummary(start, end) {
   let out = `📆 **Your schedule from ${formatDate(start)} to ${formatDate(end)}:**\n\n`;
 
   for (const ev of events) {
-    out += `• **${ev.summary}** — ${formatDate(ev.start.dateTime)} (${formatTime(
-      ev.start.dateTime
-    )}–${formatTime(ev.end.dateTime)})\n`;
+    out += `• **${ev.summary}** — ${formatDate(ev.start.dateTime)} (${formatTime(ev.start.dateTime)}–${formatTime(ev.end.dateTime)})\n`;
   }
 
   return out;
 }
 
 /* ----------------------------------------------------------
-   FIND OPEN SLOT
+   FIND FREE TIME
 ---------------------------------------------------------- */
 async function handleFindFree({ date, duration }) {
-  if (!date) return "Which date should I check for free time? 😊";
+  if (!date) return "Which date should I check? 😊";
 
   const dur = duration ? parseInt(duration) : DEFAULT_DURATION_MIN;
+
   const slots = await findOpenSlots(date, dur);
 
-  if (slots.length === 0) {
+  if (!slots || slots.length === 0) {
     return `No available **${dur}-minute** slot on **${formatDate(date)}** 😕`;
   }
 
@@ -169,7 +173,7 @@ async function handleFindFree({ date, duration }) {
 }
 
 /* ----------------------------------------------------------
-   EVENT CREATION
+   CREATE EVENT
 ---------------------------------------------------------- */
 async function handleCreateEvent({ title, date, start_time, duration }) {
   if (!title) return "What should I call the event? 😊";
@@ -177,41 +181,33 @@ async function handleCreateEvent({ title, date, start_time, duration }) {
 
   const dur = duration ? parseInt(duration) : DEFAULT_DURATION_MIN;
 
-  // If NO time given, we need to suggest 3 options
+  // SUGGESTIONS MODE
   if (!start_time) {
-    const suggestions = await findOpenSlots(date, dur, 3); // get top 3
+    const suggestions = await findOpenSlots(date, dur);
 
-    if (suggestions.length === 0) {
+    if (!suggestions || suggestions.length === 0) {
       return `I couldn't find any suitable times on **${formatDate(date)}** ❌  
 Would you like me to check the next day?`;
     }
 
-    let out = `I found a few good **${dur}-minute** time options on **${formatDate(
-      date
-    )}**:\n\n`;
-
-    suggestions.forEach((slot, i) => {
-      out += `${i + 1}. **${formatTime(slot.start)} – ${formatTime(
-        slot.end
-      )}**\n`;
+    let out = `I found some great **${dur}-minute** options on **${formatDate(date)}**:\n\n`;
+    suggestions.slice(0, 3).forEach((slot, i) => {
+      out += `${i + 1}. **${formatTime(slot.start)} – ${formatTime(slot.end)}**\n`;
     });
-
-    out += `\n👉 Reply with **1**, **2**, or **3** and I will book it.`;
+    out += `\n👉 Reply with **1**, **2**, or **3** to book it.`;
 
     return out;
   }
 
-  // Time was provided → proceed with creating event
+  // DIRECT BOOKING
   const start = new Date(`${date}T${start_time}`);
   const end = new Date(start.getTime() + dur * 60000);
 
-  // Human logic: Prevent scheduling before 08:00 or after 22:00
   if (start.getHours() < MIN_HOUR || start.getHours() > MAX_HOUR) {
-    return `😅 That time falls outside your normal scheduling hours (08:00–22:00).  
-Try another time?`;
+    return `😅 That time is outside your preferred hours (08:00–22:00). Want another time?`;
   }
 
-  const event = await createEvent({ title, start, end });
+  const created = await createEvent({ title, start, end });
 
   return `🎉 **Event added!**
 
@@ -222,12 +218,10 @@ Try another time?`;
 }
 
 /* ----------------------------------------------------------
-   FORMATTING HELPERS
+   HELPERS
 ---------------------------------------------------------- */
 function formatDate(date) {
-  return new Date(date).toLocaleDateString("en-ZA", {
-    timeZone: TIMEZONE,
-  });
+  return new Date(date).toLocaleDateString("en-ZA", { timeZone: TIMEZONE });
 }
 
 function formatTime(date) {
@@ -237,6 +231,7 @@ function formatTime(date) {
     timeZone: TIMEZONE,
   });
 }
+
 
 
 
