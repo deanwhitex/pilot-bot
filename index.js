@@ -4,10 +4,8 @@ import { Client, GatewayIntentBits, Partials } from "discord.js";
 import cron from "node-cron";
 import { handleUserMessage } from "./pilot.js";
 import { getEventsForDate, getEventsForRange } from "./calendar.js";
-import OpenAI from "openai";
 
 const TIMEZONE = "Africa/Johannesburg";
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 /* ----------------------------------------------------------
    DISCORD CLIENT
@@ -22,43 +20,59 @@ const client = new Client({
 });
 
 client.once("ready", () => {
-  console.log(`Dean Pilot is online as ${client.user.tag}`);
+  console.log(`✅ Dean Pilot is online as ${client.user.tag}`);
   initSchedulers();
 });
 
 /* ----------------------------------------------------------
-   MESSAGE HANDLER
+   MESSAGE HANDLER — bot only replies when mentioned
 ---------------------------------------------------------- */
 client.on("messageCreate", async (message) => {
   if (message.author.bot) return;
+
+  // Only respond when bot is tagged
   if (!message.mentions.has(client.user)) return;
 
+  // Remove the @mention text
   const clean = message.content.replace(/<@!?\\d+>/g, "").trim();
+
+  if (!clean) {
+    return message.reply({
+      content: "Hey Dean! 😊 What can I help you with?",
+      flags: ["SuppressEmbeds"],
+    });
+  }
 
   try {
     const response = await handleUserMessage(clean);
 
-    message.reply({
+    return message.reply({
       content: response,
-      flags: ["SuppressEmbeds"], // No preview for Zoom/Meet links
+      flags: ["SuppressEmbeds"], // make sure Zoom links don't preview
     });
   } catch (err) {
-    console.error("Bot error:", err);
-    message.reply("Sorry Dean, something went wrong. 😕");
+    console.error("❌ Error handling message:", err);
+    return message.reply({
+      content: "Sorry Dean, something went wrong 😕",
+      flags: ["SuppressEmbeds"],
+    });
   }
 });
 
 /* ----------------------------------------------------------
-   SCHEDULERS
+   SCHEDULERS — daily summary + weekly summary
 ---------------------------------------------------------- */
 function initSchedulers() {
   const channelId = process.env.DAILY_CHANNEL_ID;
+
   if (!channelId) {
-    console.error("❌ DAILY_CHANNEL_ID missing in .env");
+    console.error("❌ DAILY_CHANNEL_ID missing in your .env");
     return;
   }
 
-  /* DAILY SUMMARY — 7AM */
+  /* -----------------------------------------------
+     🕖 DAILY SUMMARY — 7AM South Africa Time
+  ----------------------------------------------- */
   cron.schedule(
     "0 7 * * *",
     async () => {
@@ -69,39 +83,34 @@ function initSchedulers() {
         const today = new Date();
         const events = await getEventsForDate(today);
 
-        let msg = `🌅 **Good morning Dean! Here's your schedule for today (${today.toLocaleDateString(
-          "en-ZA"
+        let msg = `🌅 **Good morning Dean! Here's your schedule for today (${formatDate(
+          today
         )}):**\n\n`;
 
         if (events.length === 0) {
-          msg += "You're completely free today! 😎\n";
+          msg += "✨ You're completely free today! 😎\n";
         } else {
-          for (const ev of events) {
-            msg += `• **${ev.summary}** — ${formatTime(ev.start.dateTime)} to ${formatTime(
-              ev.end.dateTime
-            )}\n`;
-          }
-        }
-
-        msg += await generateDailyPriorities(events);
-
-        if (events.length >= 6) {
-          msg += `\n⚠️ *Heads up:* Today is extremely full. Consider blocking some rest time.\n`;
+          events.forEach((ev, i) => {
+            msg += `${i + 1}. **${ev.summary}** — ${formatTime(
+              ev.start.dateTime
+            )} to ${formatTime(ev.end.dateTime)}\n`;
+          });
         }
 
         channel.send({
           content: msg,
           flags: ["SuppressEmbeds"],
         });
-
       } catch (err) {
-        console.error("Daily summary error:", err);
+        console.error("❌ Daily summary error:", err);
       }
     },
     { timezone: TIMEZONE }
   );
 
-  /* WEEKLY SUMMARY — Monday 7AM */
+  /* -----------------------------------------------
+     📅 WEEKLY SUMMARY — Monday at 7AM
+  ----------------------------------------------- */
   cron.schedule(
     "0 7 * * MON",
     async () => {
@@ -110,28 +119,30 @@ function initSchedulers() {
         if (!channel) return;
 
         const today = new Date();
-        const nextWeek = new Date(today.getTime() + 7 * 24 * 60 * 60 * 1000);
+        const nextWeek = new Date(today.getTime() + 7 * 86400000);
+
         const events = await getEventsForRange(today, nextWeek);
 
-        let msg = `📆 **Happy Monday Dean! Here's your week overview:**\n\n`;
+        let msg = `📆 **Happy Monday! Here's your week overview:**\n\n`;
 
         if (events.length === 0) {
-          msg += "Your week is completely open! 🎉";
+          msg += "✨ You have no events scheduled this week! 🎉";
         } else {
-          for (const ev of events) {
-            msg += `• **${ev.summary}** — ${formatDate(ev.start.dateTime)} (${formatTime(
+          events.forEach((ev) => {
+            msg += `• **${ev.summary}** — ${formatDate(
               ev.start.dateTime
-            )}–${formatTime(ev.end.dateTime)})\n`;
-          }
+            )} (${formatTime(ev.start.dateTime)}–${formatTime(
+              ev.end.dateTime
+            )})\n`;
+          });
         }
 
         channel.send({
           content: msg,
           flags: ["SuppressEmbeds"],
         });
-
       } catch (err) {
-        console.error("Weekly summary error:", err);
+        console.error("❌ Weekly summary error:", err);
       }
     },
     { timezone: TIMEZONE }
@@ -139,38 +150,12 @@ function initSchedulers() {
 }
 
 /* ----------------------------------------------------------
-   AI PRIORITY GENERATOR
----------------------------------------------------------- */
-async function generateDailyPriorities(events) {
-  if (events.length === 0) return "\n📌 No tasks today.\n";
-
-  try {
-    const tasks = events.map((e) => e.summary).join(", ");
-    const prompt = `
-Here are today's tasks:
-${tasks}
-
-Write a friendly, short list of top priorities.
-`;
-
-    const completion = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [{ role: "user", content: prompt }],
-    });
-
-    return `\n⭐ **Today's Priorities:**\n${completion.choices[0].message.content}\n`;
-
-  } catch (err) {
-    console.error("Priority generation error:", err);
-    return "\n⭐ Unable to generate priorities right now.\n";
-  }
-}
-
-/* ----------------------------------------------------------
-   Helpers
+   Formatting
 ---------------------------------------------------------- */
 function formatDate(date) {
-  return new Date(date).toLocaleDateString("en-ZA", { timeZone: TIMEZONE });
+  return new Date(date).toLocaleDateString("en-ZA", {
+    timeZone: TIMEZONE,
+  });
 }
 
 function formatTime(date) {
