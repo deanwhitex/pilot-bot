@@ -7,7 +7,7 @@
   "scripts": {
     "start": "node index.js"
   },
-  "dependencies": {
+ "dependencies": {
     "discord.js": "^14.12.1",
     "googleapis": "^105.0.0",
     "openai": "^4.0.0",
@@ -15,8 +15,9 @@
     "axios": "^1.6.0",
     "ffmpeg-static": "^5.2.0",
     "fluent-ffmpeg": "^2.1.2",
-    "@discordjs/voice": "^0.16.0"
-  }
+    "@discordjs/voice": "^0.16.0",
+    "dotenv": "^16.3.1"
+}
 }
 
 
