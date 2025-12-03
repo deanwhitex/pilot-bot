@@ -1,11 +1,17 @@
+// index.js
 import "dotenv/config";
 import { Client, GatewayIntentBits, Partials } from "discord.js";
 import cron from "node-cron";
 import { handleUserMessage } from "./pilot.js";
 import { getEventsForDate, getEventsForRange } from "./calendar.js";
+import OpenAI from "openai";
 
 const TIMEZONE = "Africa/Windhoek";
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
+/* ----------------------------------------------------------
+   DISCORD CLIENT
+---------------------------------------------------------- */
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -20,9 +26,9 @@ client.once("ready", () => {
   initSchedulers();
 });
 
-// ----------------------------------------------------------
-// MESSAGE HANDLER — Respond when mentioned
-// ----------------------------------------------------------
+/* ----------------------------------------------------------
+   MESSAGE HANDLER — BOT REPLIES WHEN MENTIONED
+---------------------------------------------------------- */
 client.on("messageCreate", async (message) => {
   if (message.author.bot) return;
   if (!message.mentions.has(client.user)) return;
@@ -42,19 +48,19 @@ client.on("messageCreate", async (message) => {
   }
 });
 
-// ----------------------------------------------------------
-// SCHEDULERS
-// ----------------------------------------------------------
+/* ----------------------------------------------------------
+   SCHEDULERS (Daily + Weekly)
+---------------------------------------------------------- */
 function initSchedulers() {
   const channelId = process.env.DAILY_CHANNEL_ID;
   if (!channelId) {
-    console.error("DAILY_CHANNEL_ID is not set!");
+    console.error("❌ DAILY_CHANNEL_ID missing in .env");
     return;
   }
 
-  // -----------------------------------------------
-  // 🕖 DAILY SUMMARY — 7AM EVERY DAY
-  // -----------------------------------------------
+  /* -----------------------------------------------
+     🕖 DAILY SUMMARY — 7AM EVERY DAY
+  ----------------------------------------------- */
   cron.schedule(
     "0 7 * * *",
     async () => {
@@ -79,12 +85,12 @@ function initSchedulers() {
           }
         }
 
-        // AI-generated priority list
+        // Add AI-generated priority list
         msg += await generateDailyPriorities(events);
 
-        // Overload warning
+        // Add overload warning
         if (events.length >= 6) {
-          msg += `\n⚠️ *Heads up:* Today is extremely full. Consider blocking rest time.`;
+          msg += `\n⚠️ *Heads up:* Today is extremely full. Consider blocking rest time.\n`;
         }
 
         channel.send(msg);
@@ -95,9 +101,9 @@ function initSchedulers() {
     { timezone: TIMEZONE }
   );
 
-  // -----------------------------------------------
-  // 📅 WEEKLY SUMMARY — MONDAY 07:00
-  // -----------------------------------------------
+  /* -----------------------------------------------
+     📅 WEEKLY SUMMARY — EVERY MONDAY, 07:00
+  ----------------------------------------------- */
   cron.schedule(
     "0 7 * * MON",
     async () => {
@@ -133,9 +139,9 @@ function initSchedulers() {
   );
 }
 
-// ----------------------------------------------------------
-// AI-PRIORITIES — calls the assistant to rank your tasks
-// ----------------------------------------------------------
+/* ----------------------------------------------------------
+   AI DAILY PRIORITY LIST
+---------------------------------------------------------- */
 async function generateDailyPriorities(events) {
   if (events.length === 0) return "\n📌 No tasks today.\n";
 
@@ -148,15 +154,11 @@ You are Dean's friendly scheduling assistant.
 Here are today's events:
 ${tasks}
 
-Write a short friendly list of **top priorities** for him to focus on today.
-Be brief, supportive, and positive.
+Write a short, friendly list of **top priorities** for him today.
+Keep it positive, short, and supportive.
 `;
 
-    // We call OpenAI (same as pilot.js)
-    const openai = (await import("openai")).default;
-    const clientAI = new openai({ apiKey: process.env.OPENAI_API_KEY });
-
-    const completion = await clientAI.chat.completions.create({
+    const completion = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [{ role: "user", content: prompt }],
     });
@@ -168,9 +170,9 @@ Be brief, supportive, and positive.
   }
 }
 
-// ----------------------------------------------------------
-// Formatting Helpers
-// ----------------------------------------------------------
+/* ----------------------------------------------------------
+   Formatting Helpers
+---------------------------------------------------------- */
 function formatDate(date) {
   return new Date(date).toLocaleDateString("en-ZA", { timeZone: TIMEZONE });
 }
@@ -183,9 +185,10 @@ function formatTime(date) {
   });
 }
 
-// ----------------------------------------------------------
-// LOGIN
-// ----------------------------------------------------------
+/* ----------------------------------------------------------
+   LOGIN
+---------------------------------------------------------- */
 client.login(process.env.DISCORD_TOKEN);
+
 
 
