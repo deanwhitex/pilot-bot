@@ -1,27 +1,20 @@
 {
   "name": "pilot-bot",
   "version": "1.0.0",
-  "description": "Pilot Discord Bot with Google Calendar & Voice Notes",
   "main": "index.js",
   "type": "module",
   "scripts": {
     "start": "node index.js"
   },
-   "engines": {
-    "node": "18.20.2"
-  },
- "dependencies": {
-    "discord.js": "^14.13.0",
+  "dependencies": {
+    "discord.js": "^14.14.1",
+    "dotenv": "^16.4.5",
     "googleapis": "^131.0.0",
-    "openai": "^4.23.0",
+    "openai": "^4.25.0",
     "node-cron": "^3.0.2"
-    "node-schedule": "^2.1.1",
-    "axios": "^1.6.0",
-    "ffmpeg-static": "^5.2.0",
-    "fluent-ffmpeg": "^2.1.2",
-    "@discordjs/voice": "^0.16.0",
-    "dotenv": "^16.3.1"
+  }
 }
-}
+
+
 
 
