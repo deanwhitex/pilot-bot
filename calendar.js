@@ -1,174 +1,135 @@
+// calendar.js
 import { google } from "googleapis";
 
-// ----------------------------------------------------------
-// Create Google Calendar API client
-// ----------------------------------------------------------
-export function createCalendarClient() {
-  return new google.auth.GoogleAuth({
-    credentials: {
-      type: process.env.GOOGLE_TYPE,
-      project_id: process.env.GOOGLE_PROJECT_ID,
-      private_key_id: process.env.GOOGLE_PRIVATE_KEY_ID,
-      private_key: process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, "\n"),
-      client_email: process.env.GOOGLE_CLIENT_EMAIL,
-      client_id: process.env.GOOGLE_CLIENT_ID,
-    },
-    scopes: [
-      "https://www.googleapis.com/auth/calendar",
-      "https://www.googleapis.com/auth/calendar.events",
-    ],
+/* ----------------------------------------------------------
+   AUTHENTICATION
+---------------------------------------------------------- */
+function createCalendarClient() {
+  const auth = new google.auth.JWT({
+    email: process.env.GOOGLE_CLIENT_EMAIL,
+    key: process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, "\n"),
+    scopes: ["https://www.googleapis.com/auth/calendar"],
   });
+
+  return google.calendar({ version: "v3", auth });
 }
 
-// ----------------------------------------------------------
-// List all calendars we should read
-// ----------------------------------------------------------
-export function getCalendarList() {
-  return [
-    process.env.CALENDAR_1, // dean@kingcontractor.com
-    process.env.CALENDAR_2, // deanfwhite@gmail.com
-    process.env.CALENDAR_3, // dean@deanxwhite.com
-  ].filter(Boolean);
-}
+/* ----------------------------------------------------------
+   CALENDAR LIST — all of Dean’s calendars
+---------------------------------------------------------- */
+const CALENDARS = [
+  process.env.CALENDAR_1, // dean@kingcontractor.com
+  process.env.CALENDAR_2, // deanfwhite@gmail.com
+  process.env.CALENDAR_3, // dean@deanxwhite.com
+];
 
-// ----------------------------------------------------------
-// Get ALL events for a specific day (00:00 → 23:59)
-// ----------------------------------------------------------
+/* ----------------------------------------------------------
+   GET EVENTS FOR A SPECIFIC DAY
+---------------------------------------------------------- */
 export async function getEventsForDate(date) {
-  const auth = createCalendarClient();
-  const calendar = google.calendar({ version: "v3", auth });
-
   const start = new Date(date);
   start.setHours(0, 0, 0, 0);
 
-  const end = new Date(date);
+  const end = new Date(start);
   end.setHours(23, 59, 59, 999);
 
-  const timeMin = start.toISOString();
-  const timeMax = end.toISOString();
+  return await getEventsForRange(start, end);
+}
 
-  let allEvents = [];
+/* ----------------------------------------------------------
+   GET EVENTS FOR ANY DATE RANGE
+---------------------------------------------------------- */
+export async function getEventsForRange(start, end) {
+  const calendar = createCalendarClient();
+  let events = [];
 
-  for (const cal of getCalendarList()) {
+  for (const calId of CALENDARS) {
     try {
       const res = await calendar.events.list({
-        calendarId: cal,
-        timeMin,
-        timeMax,
+        calendarId: calId,
+        timeMin: start.toISOString(),
+        timeMax: end.toISOString(),
         singleEvents: true,
         orderBy: "startTime",
       });
 
       if (res.data.items) {
-        allEvents.push(
-          ...res.data.items.map((ev) => ({ ...ev, calendarId: cal }))
-        );
+        events.push(...res.data.items);
       }
     } catch (err) {
-      console.error(`Error fetching from calendar ${cal}`, err);
+      console.error(`Error fetching events from ${calId}:`, err.message);
     }
   }
 
-  return allEvents.sort(
-    (a, b) => new Date(a.start.dateTime) - new Date(b.start.dateTime)
-  );
+  // Sort all events by actual datetime
+  events.sort((a, b) => {
+    return (
+      new Date(a.start.dateTime || a.start.date) -
+      new Date(b.start.dateTime || b.start.date)
+    );
+  });
+
+  return events;
 }
 
-// ----------------------------------------------------------
-// Get ALL events in a date range (for weekly/monthly view)
-// ----------------------------------------------------------
-export async function getEventsForRange(startDate, endDate) {
-  const auth = createCalendarClient();
-  const calendar = google.calendar({ version: "v3", auth });
+/* ----------------------------------------------------------
+   FIND OPEN SLOTS (dur = minutes)
+---------------------------------------------------------- */
+export async function findOpenSlots(date, duration) {
+  const dayEvents = await getEventsForDate(date);
 
-  const timeMin = new Date(startDate).toISOString();
-  const timeMax = new Date(endDate).toISOString();
+  const startOfDay = new Date(date);
+  startOfDay.setHours(8, 0, 0, 0);
 
-  let allEvents = [];
+  const endOfDay = new Date(date);
+  endOfDay.setHours(20, 0, 0, 0);
 
-  for (const cal of getCalendarList()) {
-    try {
-      const res = await calendar.events.list({
-        calendarId: cal,
-        timeMin,
-        timeMax,
-        singleEvents: true,
-        orderBy: "startTime",
-      });
+  const freeSlots = [];
+  let cursor = startOfDay;
 
-      if (res.data.items) {
-        allEvents.push(
-          ...res.data.items.map((ev) => ({ ...ev, calendarId: cal }))
-        );
+  for (const event of dayEvents) {
+    const evStart = new Date(event.start.dateTime);
+    const evEnd = new Date(event.end.dateTime);
+
+    if (cursor < evStart) {
+      const slotEnd = new Date(cursor.getTime() + duration * 60000);
+
+      if (slotEnd <= evStart) {
+        freeSlots.push({ start: new Date(cursor), end: slotEnd });
       }
-    } catch (err) {
-      console.error(`Error fetching calendar ${cal}`, err);
     }
+
+    // move cursor forward
+    if (evEnd > cursor) cursor = evEnd;
   }
 
-  return allEvents.sort(
-    (a, b) => new Date(a.start.dateTime) - new Date(b.start.dateTime)
-  );
+  // After last event
+  const finalSlotEnd = new Date(cursor.getTime() + duration * 60000);
+  if (finalSlotEnd <= endOfDay) {
+    freeSlots.push({ start: new Date(cursor), end: finalSlotEnd });
+  }
+
+  return freeSlots;
 }
 
-// ----------------------------------------------------------
-// Find open time slots in a given day
-// ----------------------------------------------------------
-export async function findOpenSlots(date, durationMinutes = 60) {
-  const events = await getEventsForDate(date);
-
-  const dayStart = new Date(date);
-  dayStart.setHours(6, 0, 0, 0);
-
-  const dayEnd = new Date(date);
-  dayEnd.setHours(22, 0, 0, 0);
-
-  const free = [];
-  let pointer = new Date(dayStart);
-
-  for (const ev of events) {
-    const evStart = new Date(ev.start.dateTime);
-    const evEnd = new Date(ev.end.dateTime);
-
-    if (evStart - pointer >= durationMinutes * 60000) {
-      free.push({ start: new Date(pointer), end: new Date(evStart) });
-    }
-    if (evEnd > pointer) pointer = new Date(evEnd);
-  }
-
-  if (dayEnd - pointer >= durationMinutes * 60000) {
-    free.push({ start: pointer, end: dayEnd });
-  }
-
-  return free;
-}
-
-// ----------------------------------------------------------
-// CREATE an event on dean@kingcontractor.com
-// ----------------------------------------------------------
-export async function createEvent({ title, start, end, description = "" }) {
-  const calendarId = process.env.CALENDAR_1; // ALWAYS add to main calendar
-
-  const auth = createCalendarClient();
-  const calendar = google.calendar({ version: "v3", auth });
+/* ----------------------------------------------------------
+   CREATE AN EVENT (always into kingcontractor.com primary)
+---------------------------------------------------------- */
+export async function createEvent({ title, start, end }) {
+  const calendar = createCalendarClient();
 
   const event = {
     summary: title,
-    description,
     start: { dateTime: start.toISOString() },
     end: { dateTime: end.toISOString() },
   };
 
-  try {
-    const res = await calendar.events.insert({
-      calendarId,
-      resource: event,
-    });
-    return res.data;
-  } catch (err) {
-    console.error("Error creating event:", err);
-    throw err;
-  }
+  const result = await calendar.events.insert({
+    calendarId: process.env.CALENDAR_1, // main calendar
+    resource: event,
+  });
+
+  return result.data;
 }
 
 
