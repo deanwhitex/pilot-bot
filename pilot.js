@@ -1,3 +1,4 @@
+// pilot.js
 import OpenAI from "openai";
 import {
   getEventsForDate,
@@ -12,14 +13,27 @@ const openai = new OpenAI({
 
 const TIMEZONE = "Africa/Windhoek";
 
-// ----------------------------------------------------------
-// Helper: Convert user text into structured intent
-// ----------------------------------------------------------
+/* ----------------------------------------------------------
+   REAL DATE INJECTION (CRITICAL FIX)
+   ---------------------------------------------------------- */
+function getTodayISO() {
+  const now = new Date();
+  return now.toISOString().split("T")[0]; // yyyy-mm-dd
+}
+
+/* ----------------------------------------------------------
+   INTERPRET USER MESSAGE → JSON intent
+   ---------------------------------------------------------- */
 async function interpretMessage(message) {
+  const todayISO = getTodayISO();
+
   const prompt = `
 You are Dean's friendly scheduling assistant.
 
-You MUST respond in JSON ONLY:
+Today's REAL date is **${todayISO}**.  
+All natural language dates (e.g., "tomorrow", "next Friday", "on the 4th") MUST be interpreted relative to this date.
+
+Your ONLY output must be JSON in this format:
 
 {
   "intent": "",
@@ -30,24 +44,26 @@ You MUST respond in JSON ONLY:
   "range_end": ""
 }
 
-Possible intents:
-- "day_summary" → What's on my schedule for X day
-- "find_free_time" → Find open slots
-- "create_event" → Add an event automatically
-- "range_summary" → What's my week/month look like
-- "unknown" → Cannot detect
+INTENT RULES:
+- If user asks "what's on X", "schedule for X", "my day on X" → intent = "day_summary"
+- If user says "week", "month", "range" → intent = "range_summary"
+- If user says "open slot", "free time", "availability", “space” → intent = "find_free_time"
+- If user says "add", "book", "schedule", "create event" → intent = "create_event"
+- Otherwise → "unknown"
 
-Rules:
-- If the user asks to "add", "schedule", or "book" → intent = "create_event"
-- Default event duration = 60 minutes
-- If user mentions "open slot", "free time" → intent = "find_free_time"
-- If user asks "what's on" with a specific day/date → intent = "day_summary"
-- If user mentions a week/month → intent = "range_summary"
-- Dates should be converted to ISO format if possible
-- Always be friendly in your interpretation
+DATE RULES:
+- Convert relative dates: “tomorrow”, “today”, “next Friday”, etc.
+- If the day number has passed this month (e.g., "the 4th"), move it to *next month*.
+- NEVER output past dates.
+- Always output ISO format: yyyy-mm-dd
+
+EVENT DURATION:
+- Default: 60 minutes unless user specifies.
+
+Be friendly but FOLLOW THE JSON FORMAT STRICTLY.
 
 User message: "${message}"
-`;
+  `;
 
   const completion = await openai.chat.completions.create({
     model: "gpt-4o-mini",
@@ -55,17 +71,19 @@ User message: "${message}"
     temperature: 0,
   });
 
+  let text = completion.choices[0].message.content.trim();
+
   try {
-    return JSON.parse(completion.choices[0].message.content);
+    return JSON.parse(text);
   } catch (err) {
-    console.error("Failed to parse intent JSON:", err);
+    console.error("Failed to parse JSON from AI:", text);
     return { intent: "unknown" };
   }
 }
 
-// ----------------------------------------------------------
-// Main scheduling logic
-// ----------------------------------------------------------
+/* ----------------------------------------------------------
+   MAIN MESSAGE ROUTER
+   ---------------------------------------------------------- */
 export async function handleUserMessage(message) {
   const intent = await interpretMessage(message);
 
@@ -87,67 +105,56 @@ export async function handleUserMessage(message) {
   }
 }
 
-// ----------------------------------------------------------
-// DAY SUMMARY
-// ----------------------------------------------------------
+/* ----------------------------------------------------------
+   DAY SUMMARY
+   ---------------------------------------------------------- */
 async function handleDaySummary({ date }) {
   if (!date) return "Which date should I check for you? 😊";
 
   const events = await getEventsForDate(new Date(date));
 
   if (events.length === 0) {
-    return `Looks like your schedule is *wide open* on **${formatDate(
-      date
-    )}** 😎`;
+    return `You're completely free on **${formatDate(date)}** 😎`;
   }
 
-  let out = `Here's what you have on **${formatDate(date)}**:\n\n`;
+  let out = `Here’s your schedule for **${formatDate(date)}**:\n\n`;
 
-  for (const ev of events) {
-    out += `• **${ev.summary}** — ${formatTime(ev.start.dateTime)} to ${formatTime(
-      ev.end.dateTime
-    )}\n`;
-  }
+  events.forEach(ev => {
+    out += `• **${ev.summary}** — ${formatTime(ev.start.dateTime)} to ${formatTime(ev.end.dateTime)}\n`;
+  });
 
   return out;
 }
 
-// ----------------------------------------------------------
-// RANGE SUMMARY (week/month)
-// ----------------------------------------------------------
+/* ----------------------------------------------------------
+   RANGE SUMMARY
+   ---------------------------------------------------------- */
 async function handleRangeSummary({ range_start, range_end }) {
-  if (!range_start || !range_end)
-    return "Which dates should I check for you?";
+  if (!range_start || !range_end) {
+    return "Which date range should I check for you? 😊";
+  }
 
-  const events = await getEventsForRange(
-    new Date(range_start),
-    new Date(range_end)
-  );
+  const events = await getEventsForRange(new Date(range_start), new Date(range_end));
 
   if (events.length === 0) {
-    return `Looks like you're free between ${formatDate(
-      range_start
-    )} and ${formatDate(range_end)}! 🎉`;
+    return `You're free between **${formatDate(range_start)}** and **${formatDate(range_end)}** 🎉`;
   }
 
-  let out = `Here’s everything between **${formatDate(
-    range_start
-  )}** and **${formatDate(range_end)}**:\n\n`;
+  let out = `Here’s everything from **${formatDate(range_start)}** to **${formatDate(range_end)}**:\n\n`;
 
-  for (const ev of events) {
-    out += `• **${ev.summary}** — ${formatDate(ev.start.dateTime)} (${formatTime(
-      ev.start.dateTime
-    )}–${formatTime(ev.end.dateTime)})\n`;
-  }
+  events.forEach(ev => {
+    out += `• **${ev.summary}** — ${formatDate(ev.start.dateTime)} (${formatTime(ev.start.dateTime)}–${formatTime(ev.end.dateTime)})\n`;
+  });
 
   return out;
 }
 
-// ----------------------------------------------------------
-// OPEN SLOT FINDER
-// ----------------------------------------------------------
+/* ----------------------------------------------------------
+   FIND OPEN SLOTS
+   ---------------------------------------------------------- */
 async function handleFindFree({ date, duration }) {
-  if (!date) return "What date should I help you find free time on? 😊";
+  if (!date) return "What date should I check for free time? 😊";
+
   const dur = duration ? parseInt(duration) : 60;
 
   const slots = await findOpenSlots(date, dur);
@@ -156,39 +163,37 @@ async function handleFindFree({ date, duration }) {
     return `No open ${dur}-minute slots on **${formatDate(date)}** 😕`;
   }
 
-  let out = `Here are your available ${dur}-minute slots on **${formatDate(
-    date
-  )}**:\n\n`;
+  let out = `Here are your available ${dur}-minute slots on **${formatDate(date)}**:\n\n`;
 
-  for (const s of slots) {
+  slots.forEach(s => {
     out += `• ${formatTime(s.start)} to ${formatTime(s.end)}\n`;
-  }
+  });
 
   return out;
 }
 
-// ----------------------------------------------------------
-// EVENT CREATION
-// ----------------------------------------------------------
-async function handleCreateEvent({ title, date }) {
+/* ----------------------------------------------------------
+   CREATE AN EVENT
+   ---------------------------------------------------------- */
+async function handleCreateEvent({ title, date, duration }) {
   if (!title) return "What should I call this event? 😊";
   if (!date) return "Which date should I schedule this on?";
 
-  // Default = 60 minutes
+  const dur = duration ? parseInt(duration) : 60;
+
   const start = new Date(date);
-  const end = new Date(start.getTime() + 60 * 60000);
+  const end = new Date(start.getTime() + dur * 60000);
 
   const event = await createEvent({ title, start, end });
 
-  return `All set! 🎉  
-I added **${title}** on **${formatDate(
-    start
-  )}**, from ${formatTime(start)} to ${formatTime(end)}.`;
+  return `All done! 🎉  
+I've added **${title}** on **${formatDate(start)}**,  
+from **${formatTime(start)}** to **${formatTime(end)}**.`;
 }
 
-// ----------------------------------------------------------
-// Formatting Helpers
-// ----------------------------------------------------------
+/* ----------------------------------------------------------
+   FORMATTING HELPERS
+   ---------------------------------------------------------- */
 function formatDate(date) {
   return new Date(date).toLocaleDateString("en-ZA", { timeZone: TIMEZONE });
 }
@@ -200,4 +205,5 @@ function formatTime(date) {
     timeZone: TIMEZONE,
   });
 }
+
 
