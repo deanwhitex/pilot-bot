@@ -41,7 +41,10 @@ client.on("messageCreate", async (message) => {
 
   try {
     const response = await handleUserMessage(clean);
-    message.reply(response);
+   message.reply({
+  content: response,
+  flags: ["SuppressEmbeds"]
+});
   } catch (err) {
     console.error("Bot error:", err);
     message.reply("Sorry Dean, something went wrong. 😕");
