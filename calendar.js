@@ -75,42 +75,51 @@ export async function getEventsForRange(start, end) {
 /* ----------------------------------------------------------
    FIND OPEN SLOTS (dur = minutes)
 ---------------------------------------------------------- */
-export async function findOpenSlots(date, duration) {
-  const dayEvents = await getEventsForDate(date);
+export async function findOpenSlots(date, durationMinutes = 60) {
+  const events = await getEventsForDate(new Date(date));
+  const day = new Date(date);
 
-  const startOfDay = new Date(date);
-  startOfDay.setHours(8, 0, 0, 0);
+  // Human scheduling window
+  const dayStart = new Date(day.setHours(7, 0, 0, 0));  // 07:00
+  const dayEnd = new Date(day.setHours(21, 0, 0, 0));   // 21:00
 
-  const endOfDay = new Date(date);
-  endOfDay.setHours(20, 0, 0, 0);
+  const durationMs = durationMinutes * 60 * 1000;
 
-  const freeSlots = [];
-  let cursor = startOfDay;
+  // Sort events chronologically
+  const sorted = events.sort(
+    (a, b) => new Date(a.start.dateTime) - new Date(b.start.dateTime)
+  );
 
-  for (const event of dayEvents) {
-    const evStart = new Date(event.start.dateTime);
-    const evEnd = new Date(event.end.dateTime);
+  let slots = [];
+  let cursor = dayStart;
 
-    if (cursor < evStart) {
-      const slotEnd = new Date(cursor.getTime() + duration * 60000);
+  for (const ev of sorted) {
+    const start = new Date(ev.start.dateTime);
+    const end = new Date(ev.end.dateTime);
 
-      if (slotEnd <= evStart) {
-        freeSlots.push({ start: new Date(cursor), end: slotEnd });
+    // If there's a gap big enough AND inside human hours
+    if (start - cursor >= durationMs && cursor >= dayStart && cursor < dayEnd) {
+      const potentialEnd = new Date(cursor.getTime() + durationMs);
+      if (potentialEnd <= dayEnd) {
+        slots.push({ start: new Date(cursor), end: potentialEnd });
       }
     }
 
-    // move cursor forward
-    if (evEnd > cursor) cursor = evEnd;
+    // Move cursor forward
+    if (end > cursor) cursor = end;
   }
 
-  // After last event
-  const finalSlotEnd = new Date(cursor.getTime() + duration * 60000);
-  if (finalSlotEnd <= endOfDay) {
-    freeSlots.push({ start: new Date(cursor), end: finalSlotEnd });
+  // Check one last time at the end of the day
+  if (dayEnd - cursor >= durationMs) {
+    slots.push({
+      start: new Date(cursor),
+      end: new Date(cursor.getTime() + durationMs),
+    });
   }
 
-  return freeSlots;
+  return slots;
 }
+
 
 /* ----------------------------------------------------------
    CREATE AN EVENT (always into kingcontractor.com primary)
