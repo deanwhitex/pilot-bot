@@ -114,14 +114,27 @@ async function handleDaySummary({ date }) {
   const events = await getEventsForDate(new Date(date));
 
   if (events.length === 0) {
-    return `You're completely free on **${formatDate(date)}** 😎`;
+    return `Looks like your schedule is *wide open* on **${formatDate(
+      date
+    )}** 😎`;
   }
 
-  let out = `Here’s your schedule for **${formatDate(date)}**:\n\n`;
+  let out = `📅 **Your schedule for ${formatDate(date)}:**\n\n`;
 
-  events.forEach(ev => {
-    out += `• **${ev.summary}** — ${formatTime(ev.start.dateTime)} to ${formatTime(ev.end.dateTime)}\n`;
+  events.forEach((ev, i) => {
+    out += `${i + 1}. **${ev.summary}**\n`;
+    out += `   🕒 *${formatTime(ev.start.dateTime)} – ${formatTime(
+      ev.end.dateTime
+    )}*\n`;
+
+    if (ev.location) {
+      out += `   📍 ${ev.location}\n`;
+    }
+
+    out += `\n`;
   });
+
+  out += `Let me know if you'd like changes, cancellations, or help planning the day! 😊`;
 
   return out;
 }
@@ -181,14 +194,27 @@ async function handleCreateEvent({ title, date, duration }) {
 
   const dur = duration ? parseInt(duration) : 60;
 
-  const start = new Date(date);
-  const end = new Date(start.getTime() + dur * 60000);
+  // Find a human-friendly slot
+  const slots = await findOpenSlots(date, dur);
+
+  if (slots.length === 0) {
+    return (
+      "I checked your day, Dean — there are *no reasonable free slots* (07:00–21:00). " +
+      "Would you like me to move something or try another day?"
+    );
+  }
+
+  const slot = slots[0];
+  const start = new Date(slot.start);
+  const end = new Date(slot.end);
 
   const event = await createEvent({ title, start, end });
 
-  return `All done! 🎉  
-I've added **${title}** on **${formatDate(start)}**,  
-from **${formatTime(start)}** to **${formatTime(end)}**.`;
+  return (
+    `🎉 **All done, Dean!**\n` +
+    `I’ve added **${title}** on **${formatDate(start)}**,\n` +
+    `from **${formatTime(start)} to ${formatTime(end)}**.\n`
+  );
 }
 
 /* ----------------------------------------------------------
