@@ -27,27 +27,37 @@ client.once("ready", () => {
 });
 
 /* ----------------------------------------------------------
-   MESSAGE HANDLER — BOT REPLIES WHEN MENTIONED
+   MESSAGE HANDLER — BOT REPLIES ONLY WHEN MENTIONED
 ---------------------------------------------------------- */
 client.on("messageCreate", async (message) => {
   if (message.author.bot) return;
   if (!message.mentions.has(client.user)) return;
 
+  // Remove @mention from message
   const clean = message.content.replace(/<@!?\\d+>/g, "").trim();
+
+  // If user only tagged the bot
   if (!clean) {
-    message.reply("Hey Dean! How can I help with your schedule? 😊");
-    return;
+    return message.reply({
+      content: "Hey Dean! How can I help with your schedule? 😊",
+      flags: ["SuppressEmbeds"],
+    });
   }
 
   try {
     const response = await handleUserMessage(clean);
-   message.reply({
-  content: response,
-  flags: ["SuppressEmbeds"]
-})
+
+    return message.reply({
+      content: response,
+      flags: ["SuppressEmbeds"],
+    });
+
   } catch (err) {
     console.error("Bot error:", err);
-    message.reply("Sorry Dean, something went wrong. 😕");
+    return message.reply({
+      content: "Sorry Dean, something went wrong. 😕",
+      flags: ["SuppressEmbeds"],
+    });
   }
 });
 
@@ -56,6 +66,7 @@ client.on("messageCreate", async (message) => {
 ---------------------------------------------------------- */
 function initSchedulers() {
   const channelId = process.env.DAILY_CHANNEL_ID;
+
   if (!channelId) {
     console.error("❌ DAILY_CHANNEL_ID missing in .env");
     return;
@@ -88,17 +99,17 @@ function initSchedulers() {
           }
         }
 
-        // Add AI-generated priority list
         msg += await generateDailyPriorities(events);
 
-        // Add overload warning
         if (events.length >= 6) {
           msg += `\n⚠️ *Heads up:* Today is extremely full. Consider blocking rest time.\n`;
         }
-      channel.send({
-  content: msg,
-  flags: ["SuppressEmbeds"]
-})
+
+        return channel.send({
+          content: msg,
+          flags: ["SuppressEmbeds"],
+        });
+
       } catch (err) {
         console.error("Daily summary error:", err);
       }
@@ -107,7 +118,7 @@ function initSchedulers() {
   );
 
   /* -----------------------------------------------
-     📅 WEEKLY SUMMARY — EVERY MONDAY, 07:00
+     📅 WEEKLY SUMMARY — EVERY MONDAY AT 07:00
   ----------------------------------------------- */
   cron.schedule(
     "0 7 * * MON",
@@ -135,7 +146,11 @@ function initSchedulers() {
           }
         }
 
-        channel.send(msg);
+        return channel.send({
+          content: msg,
+          flags: ["SuppressEmbeds"],
+        });
+
       } catch (err) {
         console.error("Weekly summary error:", err);
       }
@@ -169,6 +184,7 @@ Keep it positive, short, and supportive.
     });
 
     return `\n⭐ **Today's Priorities:**\n${completion.choices[0].message.content}\n`;
+
   } catch (err) {
     console.error("Priority generation error:", err);
     return "\n⭐ Unable to generate priorities right now.\n";
@@ -194,6 +210,3 @@ function formatTime(date) {
    LOGIN
 ---------------------------------------------------------- */
 client.login(process.env.DISCORD_TOKEN);
-
-
-
