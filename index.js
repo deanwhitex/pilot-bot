@@ -1,10 +1,16 @@
-// index.js
+// index.js – Pilot wiring + 8am daily summary for current day
+
 import "dotenv/config";
 import { Client, GatewayIntentBits } from "discord.js";
 import cron from "node-cron";
 import { handleUserMessage } from "./pilot.js";
 import { getEventsForDate } from "./calendar.js";
 
+const TIMEZONE = process.env.TZ || "Africa/Johannesburg";
+
+// ----------------------------------------------------------
+// DISCORD CLIENT
+// ----------------------------------------------------------
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -13,53 +19,112 @@ const client = new Client({
   ],
 });
 
+// ----------------------------------------------------------
+// READY
+// ----------------------------------------------------------
 client.once("ready", () => {
   console.log(`🔥 Pilot is online as ${client.user.tag}`);
   initSchedulers();
 });
 
-/* ----------------------------------------------------------
-   MESSAGE HANDLING — Reply to EVERYTHING
----------------------------------------------------------- */
-client.on("messageCreate", async (msg) => {
-  if (msg.author.bot) return;
+// ----------------------------------------------------------
+// MESSAGE HANDLER – reply to everything (except bots)
+// ----------------------------------------------------------
+client.on("messageCreate", async (message) => {
+  if (message.author.bot) return;
 
-  const response = await handleUserMessage(msg.content);
-  msg.reply(response);
+  try {
+    const reply = await handleUserMessage(message.content);
+
+    if (!reply || reply.trim() === "") return;
+
+    await message.reply({
+      content: reply,
+      // no embeds; links are already stripped in calendar.js
+      allowedMentions: { repliedUser: false },
+    });
+  } catch (err) {
+    console.error("Message handler error:", err);
+    try {
+      await message.reply("Sorry Dean, something went wrong. 😕");
+    } catch (_) {}
+  }
 });
 
-/* ----------------------------------------------------------
-   DAILY SUMMARY — 8 PM
----------------------------------------------------------- */
+// ----------------------------------------------------------
+// SCHEDULERS
+// ----------------------------------------------------------
 function initSchedulers() {
-  const dailyChannel = "1445756413472280668";
+  const dailyChannelId = process.env.CHANNEL_DAILY;
+  if (!dailyChannelId) {
+    console.error("❌ CHANNEL_DAILY is not set – daily summary disabled.");
+    return;
+  }
 
-  // Every day at 20:00
-  cron.schedule("0 20 * * *", async () => {
-    const channel = await client.channels.fetch(dailyChannel);
-    if (!channel) return;
+  // 8:00 AM every day – summary for TODAY
+  cron.schedule(
+    "0 8 * * *",
+    async () => {
+      try {
+        const channel = await client.channels.fetch(dailyChannelId);
+        if (!channel) {
+          console.error("❌ Could not find daily summary channel.");
+          return;
+        }
 
-    const tomorrow = new Date();
-    tomorrow.setDate(tomorrow.getDate() + 1);
+        const today = new Date();
+        const events = await getEventsForDate(today);
 
-    const events = await getEventsForDate(tomorrow);
+        const dateLabel = today.toLocaleDateString("en-ZA", {
+          timeZone: TIMEZONE,
+        });
 
-    let out = `🌅 **Tomorrow’s Schedule (${tomorrow.toLocaleDateString("en-ZA")}):**\n\n`;
+        let msg = `🌅 **Good morning, Dean! Here's your schedule for today (${dateLabel}):**\n\n`;
 
-    if (!events.length) out += "You're completely free! 😎";
-    else {
-      events.forEach((ev, i) => {
-        out += `${i + 1}. **${ev.summary}** — ${new Date(
-          ev.start.dateTime
-        ).toLocaleTimeString("en-ZA", { hour: "2-digit", minute: "2-digit" })}\n`;
-      });
-    }
+        if (!events || events.length === 0) {
+          msg += "You’re completely free today 😎\n";
+        } else {
+          events.forEach((ev, i) => {
+            msg += `${i + 1}. **${(ev.summary || "").trim()}** ${
+              ev.location ? `📍${ev.location}` : ""
+            } — ${formatTime(ev.start.dateTime)} to ${formatTime(
+              ev.end.dateTime
+            )}\n`;
+          });
 
-    channel.send(out);
+          msg += `\nLet me know if you want to cancel, move, or add anything. 😊`;
+        }
+
+        await channel.send({
+          content: msg,
+          allowedMentions: { repliedUser: false },
+        });
+      } catch (err) {
+        console.error("Daily summary error:", err);
+      }
+    },
+    { timezone: TIMEZONE }
+  );
+
+  console.log("⏰ Schedulers initialized (daily 08:00 summary).");
+}
+
+// ----------------------------------------------------------
+// HELPERS
+// ----------------------------------------------------------
+function formatTime(date) {
+  return new Date(date).toLocaleTimeString("en-ZA", {
+    hour: "2-digit",
+    minute: "2-digit",
+    timeZone: TIMEZONE,
   });
 }
 
+// ----------------------------------------------------------
+// LOGIN
+// ----------------------------------------------------------
 client.login(process.env.DISCORD_TOKEN);
+
 
 
 
