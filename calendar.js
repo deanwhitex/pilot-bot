@@ -1,127 +1,234 @@
-// calendar.js
+// calendar.js – Google Calendar helper layer for Pilot
+
 import { google } from "googleapis";
 
-const TIMEZONE = "Africa/Johannesburg";
+const TIMEZONE = process.env.TZ || "Africa/Johannesburg";
+const MIN_HOUR = 8;
+const MAX_HOUR = 22;
 
-// Your 3 calendar IDs
-export const CALENDARS = [
-  "dean@kingcontractor.com",
-  "deanfwhite@gmail.com",
-  "dean@deanxwhite.com",
-];
+// ----------------------------------------------------------
+// CALENDAR IDS (from env)
+// ----------------------------------------------------------
+const CALENDARS = [
+  process.env.CALENDAR_1,
+  process.env.CALENDAR_2,
+  process.env.CALENDAR_3,
+].filter(Boolean);
 
-// Google Authentication (Service Account)
+if (CALENDARS.length === 0) {
+  console.warn("⚠️ No CALENDAR_1/2/3 set – calendar functions will return empty.");
+}
+
+// ----------------------------------------------------------
+// GOOGLE AUTH – SERVICE ACCOUNT
+// ----------------------------------------------------------
 const auth = new google.auth.JWT(
   process.env.GOOGLE_CLIENT_EMAIL,
   null,
-  process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, "\n"),
+  // handle "\n" in env key
+  process.env.GOOGLE_PRIVATE_KEY?.replace(/\\n/g, "\n"),
   ["https://www.googleapis.com/auth/calendar"]
 );
 
 const calendar = google.calendar({ version: "v3", auth });
 
-/* ----------------------------------------------------------
-   CLEAN EVENT TEXT (remove URLs)
----------------------------------------------------------- */
-function clean(text) {
-  return text ? text.replace(/https?:\/\/\S+/g, "") : "";
+// ----------------------------------------------------------
+// UTILS
+// ----------------------------------------------------------
+function sanitizeEvent(ev, calendarId) {
+  const stripLinks = (txt) =>
+    txt ? txt.replace(/https?:\/\/\S+/g, "").trim() : "";
+
+  return {
+    ...ev,
+    calendarId,
+    summary: stripLinks(ev.summary || ""),
+    description: stripLinks(ev.description || ""),
+  };
 }
 
-/* ----------------------------------------------------------
-   GET EVENTS FOR A SINGLE DAY
----------------------------------------------------------- */
+function sortEventsByStart(a, b) {
+  return new Date(a.start.dateTime || a.start.date) -
+    new Date(b.start.dateTime || b.start.date);
+}
+
+// ----------------------------------------------------------
+// GET ALL EVENTS FOR A SINGLE DAY (merged across calendars)
+// ----------------------------------------------------------
 export async function getEventsForDate(date) {
-  const start = new Date(date);
-  const end = new Date(date);
+  const d = date instanceof Date ? new Date(date) : new Date(date);
+
+  const start = new Date(d);
+  start.setHours(0, 0, 0, 0);
+
+  const end = new Date(d);
   end.setHours(23, 59, 59, 999);
 
   return await getEventsForRange(start, end);
 }
 
-/* ----------------------------------------------------------
-   GET EVENTS ACROSS ALL 3 CALENDARS (MERGED)
----------------------------------------------------------- */
+// ----------------------------------------------------------
+// GET EVENTS IN RANGE (merged across calendars)
+// ----------------------------------------------------------
 export async function getEventsForRange(start, end) {
-  let merged = [];
+  if (!CALENDARS.length) return [];
+
+  const timeMin = (start instanceof Date ? start : new Date(start)).toISOString();
+  const timeMax = (end instanceof Date ? end : new Date(end)).toISOString();
+
+  let allEvents = [];
 
   for (const calId of CALENDARS) {
-    const res = await calendar.events.list({
-      calendarId: calId,
-      timeMin: start.toISOString(),
-      timeMax: end.toISOString(),
-      singleEvents: true,
-      orderBy: "startTime",
-    });
+    try {
+      const res = await calendar.events.list({
+        calendarId: calId,
+        timeMin,
+        timeMax,
+        singleEvents: true,
+        orderBy: "startTime",
+        showDeleted: false,
+      });
 
-    if (!res.data.items) continue;
-
-    const cleaned = res.data.items.map(ev => ({
-      ...ev,
-      calendarId: calId,
-      summary: clean(ev.summary),
-      description: clean(ev.description),
-    }));
-
-    merged.push(...cleaned);
+      const items = res.data.items || [];
+      const cleaned = items.map((e) => sanitizeEvent(e, calId));
+      allEvents.push(...cleaned);
+    } catch (err) {
+      console.error(`Error fetching events from ${calId}:`, err.message);
+    }
   }
 
-  merged.sort(
-    (a, b) => new Date(a.start.dateTime) - new Date(b.start.dateTime)
-  );
-
-  return merged;
+  allEvents.sort(sortEventsByStart);
+  return allEvents;
 }
 
-/* ----------------------------------------------------------
-   SEARCH EVENTS BY TEXT (for cancel / reschedule)
----------------------------------------------------------- */
-export async function searchEventsByText(query) {
-  const today = new Date();
-  const nextYear = new Date();
-  nextYear.setFullYear(today.getFullYear() + 1);
+// ----------------------------------------------------------
+// FIND FREE SLOTS BETWEEN 08:00–22:00
+// ----------------------------------------------------------
+export async function findOpenSlots(date, durationMin, limit = 100) {
+  const d = date instanceof Date ? new Date(date) : new Date(date);
 
-  const events = await getEventsForRange(today, nextYear);
+  const events = await getEventsForDate(d);
+  const durationMs = durationMin * 60 * 1000;
 
-  return events.filter(ev =>
-    ev.summary.toLowerCase().includes(query.toLowerCase())
-  );
+  const dayStart = new Date(d);
+  dayStart.setHours(MIN_HOUR, 0, 0, 0);
+
+  const dayEnd = new Date(d);
+  dayEnd.setHours(MAX_HOUR, 0, 0, 0);
+
+  const free = [];
+  let cursor = dayStart;
+
+  for (const ev of events) {
+    const evStart = new Date(ev.start.dateTime || ev.start.date);
+    const evEnd = new Date(ev.end.dateTime || ev.end.date);
+
+    // skip all-day events (no dateTime)
+    if (!ev.start.dateTime && ev.start.date) continue;
+
+    if (evStart - cursor >= durationMs) {
+      free.push({
+        start: new Date(cursor),
+        end: new Date(cursor.getTime() + durationMs),
+      });
+    }
+
+    if (evEnd > cursor) cursor = evEnd;
+  }
+
+  // tail of day
+  if (dayEnd - cursor >= durationMs) {
+    free.push({
+      start: new Date(cursor),
+      end: new Date(cursor.getTime() + durationMs),
+    });
+  }
+
+  return free.slice(0, limit);
 }
 
-/* ----------------------------------------------------------
-   CANCEL EVENT
----------------------------------------------------------- */
-export async function cancelEventById(calendarId, eventId) {
-  return await calendar.events.delete({
-    calendarId,
-    eventId,
-  });
-}
-
-/* ----------------------------------------------------------
-   RESCHEDULE EVENT
----------------------------------------------------------- */
-export async function rescheduleEventById(calendarId, eventId, newStart, newEnd) {
-  return await calendar.events.patch({
-    calendarId,
-    eventId,
-    requestBody: {
-      start: { dateTime: newStart.toISOString(), timeZone: TIMEZONE },
-      end: { dateTime: newEnd.toISOString(), timeZone: TIMEZONE },
-    },
-  });
-}
-
-/* ----------------------------------------------------------
-   CREATE EVENT (always into primary calendar)
----------------------------------------------------------- */
+// ----------------------------------------------------------
+// CREATE EVENT (always on primary calendar)
+// ----------------------------------------------------------
 export async function createEvent({ title, start, end }) {
-  return await calendar.events.insert({
-    calendarId: CALENDARS[0],
+  const primary = CALENDARS[0];
+  if (!primary) throw new Error("No CALENDAR_1 configured.");
+
+  const startDate = start instanceof Date ? start : new Date(start);
+  const endDate = end instanceof Date ? end : new Date(end);
+
+  const res = await calendar.events.insert({
+    calendarId: primary,
     requestBody: {
       summary: title,
-      start: { dateTime: start.toISOString(), timeZone: TIMEZONE },
-      end: { dateTime: end.toISOString(), timeZone: TIMEZONE },
+      start: {
+        dateTime: startDate.toISOString(),
+        timeZone: TIMEZONE,
+      },
+      end: {
+        dateTime: endDate.toISOString(),
+        timeZone: TIMEZONE,
+      },
     },
+  });
+
+  return sanitizeEvent(res.data, primary);
+}
+
+// ----------------------------------------------------------
+// CANCEL EVENT BY ID
+// ----------------------------------------------------------
+export async function cancelEventById(calendarId, eventId) {
+  if (!calendarId || !eventId) throw new Error("calendarId and eventId required");
+  await calendar.events.delete({
+    calendarId,
+    eventId,
+  });
+}
+
+// ----------------------------------------------------------
+// RESCHEDULE EVENT BY ID
+// ----------------------------------------------------------
+export async function rescheduleEventById(calendarId, eventId, newStart, newEnd) {
+  if (!calendarId || !eventId) throw new Error("calendarId and eventId required");
+
+  const startDate = newStart instanceof Date ? newStart : new Date(newStart);
+  const endDate = newEnd instanceof Date ? newEnd : new Date(newEnd);
+
+  await calendar.events.patch({
+    calendarId,
+    eventId,
+    requestBody: {
+      start: {
+        dateTime: startDate.toISOString(),
+        timeZone: TIMEZONE,
+      },
+      end: {
+        dateTime: endDate.toISOString(),
+        timeZone: TIMEZONE,
+      },
+    },
+  });
+}
+
+// ----------------------------------------------------------
+// SEARCH EVENTS BY TEXT (next 30 days across all calendars)
+// ----------------------------------------------------------
+export async function searchEventsByText(text) {
+  if (!text) return [];
+  if (!CALENDARS.length) return [];
+
+  const now = new Date();
+  const end = new Date(now);
+  end.setDate(end.getDate() + 30);
+
+  const events = await getEventsForRange(now, end);
+  const q = text.toLowerCase();
+
+  return events.filter((ev) => {
+    const s = (ev.summary || "").toLowerCase();
+    const d = (ev.description || "").toLowerCase();
+    return s.includes(q) || d.includes(q);
   });
 }
 
