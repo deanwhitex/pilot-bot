@@ -1,10 +1,6 @@
-// -----------------------------------------------------------------------------
-// pilot.js — Full Chief-of-Staff Brain for Pilot
-// -----------------------------------------------------------------------------
-
+// pilot.js
 import OpenAI from "openai";
 import fs from "fs";
-
 import {
   getEventsForDate,
   getEventsForRange,
@@ -15,26 +11,15 @@ import {
   searchEventsByText
 } from "./calendar.js";
 
-
-
-// -----------------------------------------------------------------------------
-// CONSTANTS
-// -----------------------------------------------------------------------------
-
 const TIMEZONE = "Africa/Johannesburg";
-
 const MIN_HOUR = 8;
 const MAX_HOUR = 22;
-
 const DEFAULT_DURATION_MIN = 60;
 
+// ---------------------------------------------------------
+// MEMORY SYSTEM (local memory.json)
+// ---------------------------------------------------------
 const MEMORY_FILE = "./memory.json";
-
-
-
-// -----------------------------------------------------------------------------
-// MEMORY ENGINE — Patterns, Preferences, Mood
-// -----------------------------------------------------------------------------
 
 let memory = {
   preferences: {
@@ -42,12 +27,6 @@ let memory = {
     preferred_gym_time: "afternoon",
     meeting_buffer_min: 10
   },
-
-  patterns: {
-    gym_time: { morning: 0.1, afternoon: 0.8, evening: 0.1 },
-    focus_productivity: { morning: 0.6, afternoon: 0.4 }
-  },
-
   energy_profile: {
     morning: "medium",
     afternoon: "high",
@@ -58,7 +37,7 @@ let memory = {
 try {
   if (fs.existsSync(MEMORY_FILE)) {
     memory = JSON.parse(fs.readFileSync(MEMORY_FILE, "utf8"));
-    console.log("Memory loaded.");
+    console.log("🧠 Memory loaded.");
   }
 } catch (err) {
   console.error("Memory load error:", err);
@@ -68,57 +47,43 @@ function saveMemory() {
   fs.writeFileSync(MEMORY_FILE, JSON.stringify(memory, null, 2));
 }
 
+// ---------------------------------------------------------
+// OPENAI
+// ---------------------------------------------------------
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-
-// -----------------------------------------------------------------------------
-// OPENAI CLIENT
-// -----------------------------------------------------------------------------
-
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY
-});
-
-
-
-// -----------------------------------------------------------------------------
-// INTENT DETECTION (used by index.js to filter non-scheduling chatter)
-// -----------------------------------------------------------------------------
-
-export async function detectIntentType(message) {
-  const schedulingWords = [
+// ---------------------------------------------------------
+// INTENT DETECTOR FOR index.js (route filter)
+// ---------------------------------------------------------
+export function detectIntentType(message) {
+  const schedulingTriggers = [
     "schedule",
-    "book",
     "add",
-    "what's on",
+    "book",
     "cancel",
     "move",
     "reschedule",
-    "free time",
-    "slot",
     "appointment",
-    "meeting",
+    "event",
+    "what's on",
+    "free time",
+    "open slot",
     "plan my week",
-    "plan my day",
-    "help me plan"
+    "plan my day"
   ];
 
-  return schedulingWords.some((w) =>
-    message.toLowerCase().includes(w)
+  return schedulingTriggers.some((x) =>
+    message.toLowerCase().includes(x)
   );
 }
 
-
-
-// -----------------------------------------------------------------------------
-// FULL INTENT PARSER
-// Zero hallucination guarantees for scheduling
-// -----------------------------------------------------------------------------
-
+// ---------------------------------------------------------
+// FULL AI PARSER
+// ---------------------------------------------------------
 async function interpretMessage(message) {
   const prompt = `
-You are Pilot, Dean’s AI Chief-of-Staff.
-
-Convert his message into STRICT JSON:
+You are Dean’s AI Chief-of-Staff.
+Interpret his message and output STRICT JSON:
 
 {
   "intent": "",
@@ -132,79 +97,65 @@ Convert his message into STRICT JSON:
   "target_event": ""
 }
 
-Valid intents:
+INTENTS:
+- "assistant_chat"
 - "day_summary"
 - "range_summary"
 - "find_free_time"
 - "create_event"
 - "cancel_event"
 - "reschedule_event"
-- "plan_day"
 - "plan_week"
+- "plan_day"
 - "life_advice"
-- "assistant_chat"
 - "unknown"
 
-Rules:
-- “Plan my week” → intent = plan_week
-- “Cancel …” → intent = cancel_event
-- “Move / reschedule …” → intent = reschedule_event
-- “Add / book / schedule …” → intent = create_event
-- If no scheduling words → assistant_chat
-- NEVER guess events. NEVER invent schedules. NEVER hallucinate.
-- If you cannot extract a field → use empty string.
-- Output ONLY valid JSON.
-
-USER MESSAGE:
+RULES:
+- If he says “cancel”, → cancel_event
+- “move/reschedule” → reschedule_event
+- “week/month/between” → range_summary
+- “free time/open slot” → find_free_time
+- “add/book/schedule” → create_event
+- If no scheduling meaning → assistant_chat
+- Keep JSON valid.
+- No text outside JSON.
+  
+User message:
 "${message}"
   `;
 
-  const completion = await openai.chat.completions.create({
+  const out = await openai.chat.completions.create({
     model: "gpt-4o-mini",
-    temperature: 0,
-    messages: [
-      { role: "user", content: prompt }
-    ]
+    messages: [{ role: "user", content: prompt }],
+    temperature: 0
   });
 
   try {
-    return JSON.parse(completion.choices[0].message.content);
+    return JSON.parse(out.choices[0].message.content);
   } catch {
     return { intent: "unknown" };
   }
 }
 
-
-
-// -----------------------------------------------------------------------------
-// MAIN ROUTER
-// -----------------------------------------------------------------------------
-
+// ---------------------------------------------------------
+// MAIN HANDLER
+// ---------------------------------------------------------
 export async function handleUserMessage(message) {
+  detectMood(message); // update memory if needed
   const intent = await interpretMessage(message);
 
-  // Update mood / preferences based on conversation
-  detectMood(message);
-
   switch (intent.intent) {
-
     case "assistant_chat":
       return conversationalReply(message);
 
+    case "life_advice":
+      return lifeAdvice(message);
+
     case "plan_week":
-      return startWeeklyPlanning();
+      return weeklyPlanningMessage();
 
-    case "cancel_event":
-      return await handleCancel(intent);
-
-    case "reschedule_event":
-      return await handleReschedule(intent);
-
-    case "create_event":
-      return await handleCreateEvent(intent);
-
-    case "find_free_time":
-      return await handleFindFree(intent);
+    case "plan_day":
+      return planMyDay(intent.date);
 
     case "day_summary":
       return await handleDaySummary(intent.date);
@@ -212,195 +163,167 @@ export async function handleUserMessage(message) {
     case "range_summary":
       return await handleRangeSummary(intent.range_start, intent.range_end);
 
-    case "plan_day":
-      return planMyDay(intent.date);
+    case "find_free_time":
+      return await handleFindFree(intent);
 
-    case "life_advice":
-      return await lifeAdvice(message);
+    case "create_event":
+      return await handleCreateEvent(intent);
+
+    case "cancel_event":
+      return await handleCancel(intent);
+
+    case "reschedule_event":
+      return await handleReschedule(intent);
 
     default:
-      return "I'm not entirely sure what you mean, but I'm here to help. 😊";
+      return "I’m not entirely sure what you mean, but I’m here to help. 😊";
   }
 }
 
-
-
-// -----------------------------------------------------------------------------
-// GENERAL CHAT MODE
-// -----------------------------------------------------------------------------
-
+// ---------------------------------------------------------
+// GREETING / CONVERSATIONAL MODE
+// ---------------------------------------------------------
 function conversationalReply(message) {
-  return `Of course, Dean — ${message}`;
+  return `Sure Dean — ${message}`;
 }
 
-
-
-// -----------------------------------------------------------------------------
-// MOOD + BEHAVIOR TRACKING
-// -----------------------------------------------------------------------------
-
+// ---------------------------------------------------------
+// MOOD & PATTERN DETECTION
+// ---------------------------------------------------------
 function detectMood(message) {
   const m = message.toLowerCase();
 
   if (m.includes("tired") || m.includes("exhausted")) {
-    memory.energy_profile.afternoon = "lower";
+    memory.energy_profile.morning = "low";
     saveMemory();
   }
 
-  if (m.includes("stress") || m.includes("overwhelmed")) {
+  if (m.includes("stressed") || m.includes("overwhelmed")) {
     memory.preferences.avoid_early_mornings = true;
     saveMemory();
   }
 }
 
-
-
-// -----------------------------------------------------------------------------
+// ---------------------------------------------------------
 // CANCEL EVENT
-// -----------------------------------------------------------------------------
-
+// ---------------------------------------------------------
 async function handleCancel({ target_event }) {
   if (!target_event) return "Which event should I cancel?";
 
   const matches = await searchEventsByText(target_event);
-
-  if (matches.length === 0) {
-    return `I couldn't find anything matching "${target_event}".`;
-  }
+  if (matches.length === 0) return "I couldn’t find that event.";
 
   if (matches.length === 1) {
     await cancelEventById(matches[0].calendarId, matches[0].id);
-    return `🗑️ Done — I cancelled **${matches[0].summary}** at ${formatTime(matches[0].start.dateTime)}.`;
+    return `🗑️ Cancelled **${matches[0].summary}** at ${formatTime(
+      matches[0].start.dateTime
+    )}.`;
   }
 
-  let out = "I found multiple matching events:\n\n";
-
+  let out = "I found multiple events:\n\n";
   matches.forEach((m, i) => {
-    out += `${i + 1}. **${m.summary}** — ${formatDate(m.start.dateTime)}, ${formatTime(m.start.dateTime)}\n`;
+    out += `${i + 1}. **${m.summary}** — ${formatTime(
+      m.start.dateTime
+    )}\n`;
   });
 
-  out += "\nReply with the number to cancel.";
-
-  return out;
+  return out + "\nReply 1, 2, or 3 to pick.";
 }
 
-
-
-// -----------------------------------------------------------------------------
+// ---------------------------------------------------------
 // RESCHEDULE EVENT
-// -----------------------------------------------------------------------------
-
+// ---------------------------------------------------------
 async function handleReschedule({ target_event, date, start_time }) {
-  if (!target_event) return "Which event should I reschedule?";
+  if (!target_event) return "Which event should I move?";
 
   const matches = await searchEventsByText(target_event);
-
-  if (matches.length === 0) {
-    return "I couldn't find that event.";
-  }
+  if (matches.length === 0) return "I couldn’t find that event.";
 
   if (matches.length > 1) {
-    let out = "I found several events. Which one should I move?\n\n";
-
+    let out = "I found several matching events:\n\n";
     matches.forEach((m, i) => {
-      out += `${i + 1}. **${m.summary}** — ${formatDate(m.start.dateTime)} at ${formatTime(m.start.dateTime)}\n`;
+      out += `${i + 1}. **${m.summary}** (${formatDate(
+        m.start.dateTime
+      )} at ${formatTime(m.start.dateTime)})\n`;
     });
-
-    return out;
+    return out + "\nWhich one should I reschedule?";
   }
 
-  const event = matches[0];
+  const ev = matches[0];
 
-  // Suggest three new times if no time was given
   if (!start_time) {
-    const baseDate = date || event.start.dateTime;
+    const suggestions = await findOpenSlots(date, 60, 3);
 
-    const suggestions = await findOpenSlots(baseDate, 60, 3);
+    if (suggestions.length === 0)
+      return "No good times found that day. Try another date?";
 
-    if (suggestions.length === 0) {
-      return "I couldn't find any good alternative times that day.";
-    }
-
-    let out = `Here are good options for **${event.summary}**:\n\n`;
-
+    let out = `Here are good options for **${ev.summary}**:\n\n`;
     suggestions.forEach((s, i) => {
-      out += `${i + 1}. ${formatTime(s.start)} – ${formatTime(s.end)}\n`;
+      out += `${i + 1}. ${formatTime(s.start)} – ${formatTime(
+        s.end
+      )}\n`;
     });
 
-    out += "\nReply with the number you prefer.";
-
-    return out;
+    return out + "\nChoose 1–3.";
   }
 
-  // Reschedule to a specific time
   const newStart = new Date(`${date}T${start_time}`);
   const newEnd = new Date(newStart.getTime() + 60 * 60000);
 
-  await rescheduleEventById(event.calendarId, event.id, newStart, newEnd);
+  await rescheduleEventById(ev.calendarId, ev.id, newStart, newEnd);
 
-  return `🔄 Done — I’ve moved **${event.summary}** to ${formatTime(newStart)}.`;
+  return `🔄 Rescheduled **${ev.summary}** to ${formatTime(newStart)}.`;
 }
 
-
-
-// -----------------------------------------------------------------------------
+// ---------------------------------------------------------
 // CREATE EVENT
-// -----------------------------------------------------------------------------
-
+// ---------------------------------------------------------
 async function handleCreateEvent({ title, date, start_time, duration }) {
-  if (!title) return "What should I call the event?";
-  if (!date) return "Which date should I schedule it on?";
+  if (!title) return "What should I call this event?";
+  if (!date) return "Which date?";
 
   const dur = duration ? parseInt(duration) : DEFAULT_DURATION_MIN;
 
-  // Suggest times if none specified
+  // No time → suggest options
   if (!start_time) {
-    const suggestions = await findOpenSlots(date, dur, 3);
+    const slots = await findOpenSlots(date, dur, 3);
 
-    if (suggestions.length === 0) {
-      return "I couldn’t find any available times that day.";
-    }
+    if (slots.length === 0)
+      return "No available slots that day — check another?";
 
     let out = `Here are available times for **${title}**:\n\n`;
-
-    suggestions.forEach((s, i) => {
+    slots.forEach((s, i) => {
       out += `${i + 1}. ${formatTime(s.start)} – ${formatTime(s.end)}\n`;
     });
 
-    out += "\nReply with 1, 2, or 3 to book.";
-
-    return out;
+    return out + "\nChoose 1–3.";
   }
 
   const start = new Date(`${date}T${start_time}`);
   const end = new Date(start.getTime() + dur * 60000);
 
   if (start.getHours() < MIN_HOUR || start.getHours() > MAX_HOUR) {
-    return "That time is outside your preferred scheduling hours (08:00–22:00).";
+    return "That time is outside your usual working hours (08:00–22:00).";
   }
 
   await createEvent({ title, start, end });
 
-  return `🎉 Done — I added **${title}** for ${formatDate(start)} at ${formatTime(start)}.`;
+  return `🎉 Added **${title}** on ${formatDate(start)} at ${formatTime(
+    start
+  )}.`;
 }
 
-
-
-// -----------------------------------------------------------------------------
-// FIND FREE TIME
-// -----------------------------------------------------------------------------
-
+// ---------------------------------------------------------
+// FREE TIME FINDER
+// ---------------------------------------------------------
 async function handleFindFree({ date, duration }) {
   const dur = duration || DEFAULT_DURATION_MIN;
 
   const slots = await findOpenSlots(date, dur);
+  if (slots.length === 0)
+    return "No free time on that day 😕";
 
-  if (slots.length === 0) {
-    return "No free time that day.";
-  }
-
-  let out = `Here are your available ${dur}-minute slots:\n\n`;
-
+  let out = `Here are your open ${dur}-minute slots:\n\n`;
   slots.forEach((s) => {
     out += `• ${formatTime(s.start)} – ${formatTime(s.end)}\n`;
   });
@@ -408,20 +331,16 @@ async function handleFindFree({ date, duration }) {
   return out;
 }
 
-
-
-// -----------------------------------------------------------------------------
+// ---------------------------------------------------------
 // DAY SUMMARY
-// -----------------------------------------------------------------------------
-
+// ---------------------------------------------------------
 async function handleDaySummary(date) {
-  if (!date) return "Which date should I check?";
+  if (!date) return "Which date?";
 
   const events = await getEventsForDate(date);
 
-  if (events.length === 0) {
-    return `You’re free on **${formatDate(date)}**. 😎`;
-  }
+  if (events.length === 0)
+    return `You're completely free on **${formatDate(date)}** 😎`;
 
   let out = `📅 **Your schedule for ${formatDate(date)}:**\n\n`;
 
@@ -432,111 +351,81 @@ async function handleDaySummary(date) {
   return out;
 }
 
-
-
-// -----------------------------------------------------------------------------
+// ---------------------------------------------------------
 // RANGE SUMMARY
-// -----------------------------------------------------------------------------
-
+// ---------------------------------------------------------
 async function handleRangeSummary(start, end) {
   const events = await getEventsForRange(start, end);
 
-  if (events.length === 0) {
+  if (events.length === 0)
     return `No events between ${formatDate(start)} and ${formatDate(end)}.`;
-  }
 
-  let out = `📆 **Your schedule from ${formatDate(start)} to ${formatDate(end)}:**\n\n`;
+  let out = `📆 **${formatDate(start)} to ${formatDate(end)}:**\n\n`;
 
   events.forEach((ev) => {
-    out += `• **${ev.summary}** — ${formatDate(ev.start.dateTime)} (${formatTime(ev.start.dateTime)})\n`;
+    out += `• **${ev.summary}** (${formatDate(ev.start.dateTime)} — ${formatTime(
+      ev.start.dateTime
+    )})\n`;
   });
 
   return out;
 }
 
-
-
-// -----------------------------------------------------------------------------
-// WEEKLY PLAN MODE
-// -----------------------------------------------------------------------------
-
-function startWeeklyPlanning() {
+// ---------------------------------------------------------
+// WEEKLY PLANNING ENTRY POINT
+// ---------------------------------------------------------
+function weeklyPlanningMessage() {
   return `
-🧠 **Weekly Planning Activated**
+🧭 **Weekly Planning Mode**
 
-Great, Dean. Let’s get ahead of your week.
+Great Dean — let's build your week.
 
-I will consider:
-• workload  
-• gym patterns  
-• energy profile  
-• personal boundaries  
-• deep work needs  
-• meetings  
-• rest periods  
+Tell me one of these:
 
-Tell me:
-- **"Plan my week with priorities"**  
-- **"Plan my week around energy"**  
-- **"Build a balanced week"**  
+• **Plan my week with priorities**  
+• **Plan my week around energy**  
+• **Build a balanced week**
+
+I’ll integrate:
+- Workload  
+- Energy profile  
+- Gym habits  
+- Meetings  
+- Rest time  
+- Boundaries  
+- Productivity windows  
 `;
 }
 
-
-
-// -----------------------------------------------------------------------------
-// PLAN MY DAY (High-level guidance)
-// -----------------------------------------------------------------------------
-
-function planMyDay(date) {
-  return `
-🗓️ **Daily Planning**
-
-Alright Dean, let’s plan ${date} intelligently.
-
-Tell me:
-- "Focus morning"  
-- "Stack meetings"  
-- "Light workload"  
-- "Balance the day"  
-`;
-}
-
-
-
-// -----------------------------------------------------------------------------
-// LIFE ADVICE MODE
-// -----------------------------------------------------------------------------
-
+// ---------------------------------------------------------
+// LIFE ADVICE (Chief-of-Staff mode)
+// ---------------------------------------------------------
 async function lifeAdvice(message) {
   const prompt = `
-You are Dean’s AI Chief-of-Staff.
+You are Dean’s Chief-of-Staff and personal strategist.
 
-He said: "${message}"
+He said:
+"${message}"
 
-Respond with:
-- elite strategic insight  
-- friendly tone  
-- actionable advice  
-- short & sharp guidance  
+Reply with:
+- Confidence  
+- Strategic clarity  
+- Emotional intelligence  
+- Practical action steps  
+- No fluff  
   `;
 
-  const response = await openai.chat.completions.create({
+  const out = await openai.chat.completions.create({
     model: "gpt-4o-mini",
-    messages: [
-      { role: "user", content: prompt }
-    ]
+    messages: [{ role: "user", content: prompt }]
   });
 
-  return response.choices[0].message.content;
+  return out.choices[0].message.content;
 }
 
-
-
-// -----------------------------------------------------------------------------
+// ---------------------------------------------------------
 // HELPERS
-// -----------------------------------------------------------------------------
-
+// ---------------------------------------------------------
 function formatDate(date) {
   return new Date(date).toLocaleDateString("en-ZA", {
     timeZone: TIMEZONE
@@ -550,13 +439,6 @@ function formatTime(date) {
     timeZone: TIMEZONE
   });
 }
-
-
-
-// -----------------------------------------------------------------------------
-// END — pilot.js
-// -----------------------------------------------------------------------------
-
 
 
 
