@@ -1,104 +1,66 @@
-// index.js (FULL RESET — Reply to everything, stable scheduling)
+// index.js
 import "dotenv/config";
-import { Client, GatewayIntentBits, Partials } from "discord.js";
-import { handleUserMessage } from "./pilot.js";
+import { Client, GatewayIntentBits } from "discord.js";
 import cron from "node-cron";
+import { handleUserMessage } from "./pilot.js";
 import { getEventsForDate } from "./calendar.js";
-
-const TIMEZONE = "Africa/Johannesburg";
 
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent
+    GatewayIntentBits.MessageContent,
   ],
-  partials: [Partials.Channel]
 });
 
 client.once("ready", () => {
   console.log(`🔥 Pilot is online as ${client.user.tag}`);
-  initDailySummary();
+  initSchedulers();
 });
 
-// ----------------------------------------------------------
-// 🌍 REPLY TO EVERYTHING ANYONE SAYS
-// ----------------------------------------------------------
-client.on("messageCreate", async (message) => {
-  if (message.author.bot) return; // ignore bots
+/* ----------------------------------------------------------
+   MESSAGE HANDLING — Reply to EVERYTHING
+---------------------------------------------------------- */
+client.on("messageCreate", async (msg) => {
+  if (msg.author.bot) return;
 
-  try {
-    const reply = await handleUserMessage(message.content);
-
-    await message.reply({
-      content: reply,
-      flags: ["SuppressEmbeds"] // hide link previews
-    });
-
-  } catch (err) {
-    console.error("Pilot error:", err);
-    message.reply("Sorry Dean — something went wrong. 😕");
-  }
+  const response = await handleUserMessage(msg.content);
+  msg.reply(response);
 });
 
-// ----------------------------------------------------------
-// DAILY 7AM SUMMARY — sends to DAILY channel
-// ----------------------------------------------------------
-function initDailySummary() {
-  const dailyChannelId = process.env.DAILY_CHANNEL_ID;
+/* ----------------------------------------------------------
+   DAILY SUMMARY — 8 PM
+---------------------------------------------------------- */
+function initSchedulers() {
+  const dailyChannel = "1445756413472280668";
 
-  if (!dailyChannelId) {
-    console.error("❌ DAILY_CHANNEL_ID missing from .env");
-    return;
-  }
+  // Every day at 20:00
+  cron.schedule("0 20 * * *", async () => {
+    const channel = await client.channels.fetch(dailyChannel);
+    if (!channel) return;
 
-  cron.schedule(
-    "0 7 * * *",
-    async () => {
-      try {
-        const channel = await client.channels.fetch(dailyChannelId);
-        if (!channel) return;
+    const tomorrow = new Date();
+    tomorrow.setDate(tomorrow.getDate() + 1);
 
-        const today = new Date();
-        const events = await getEventsForDate(today);
+    const events = await getEventsForDate(tomorrow);
 
-        let msg = `🌅 **Good morning Dean! Here's your schedule for today (${today.toLocaleDateString(
-          "en-ZA"
-        )}):**\n\n`;
+    let out = `🌅 **Tomorrow’s Schedule (${tomorrow.toLocaleDateString("en-ZA")}):**\n\n`;
 
-        if (events.length === 0) {
-          msg += "You're completely free today! 😎";
-        } else {
-          events.forEach((ev) => {
-            msg += `• **${ev.summary.trim()}** — ${formatTime(
-              ev.start.dateTime
-            )} to ${formatTime(ev.end.dateTime)}\n`;
-          });
-        }
+    if (!events.length) out += "You're completely free! 😎";
+    else {
+      events.forEach((ev, i) => {
+        out += `${i + 1}. **${ev.summary}** — ${new Date(
+          ev.start.dateTime
+        ).toLocaleTimeString("en-ZA", { hour: "2-digit", minute: "2-digit" })}\n`;
+      });
+    }
 
-        channel.send({
-          content: msg,
-          flags: ["SuppressEmbeds"]
-        });
-
-      } catch (err) {
-        console.error("Daily Summary Error:", err);
-      }
-    },
-    { timezone: TIMEZONE }
-  );
-}
-
-// ----------------------------------------------------------
-function formatTime(date) {
-  return new Date(date).toLocaleTimeString("en-ZA", {
-    hour: "2-digit",
-    minute: "2-digit",
-    timeZone: TIMEZONE
+    channel.send(out);
   });
 }
 
 client.login(process.env.DISCORD_TOKEN);
+
 
 
 
