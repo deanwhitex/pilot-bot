@@ -1,17 +1,18 @@
 // calendar.js
 import { google } from "googleapis";
 
-const TIMEZONE = "Africa/Johannesburg";   // unified timezone
+const TIMEZONE = "Africa/Johannesburg";
 const MIN_HOUR = 8;
 const MAX_HOUR = 22;
 
+// Your three calendars
 const CALENDARS = [
   "dean@kingcontractor.com",
   "deanfwhite@gmail.com",
-  "dean@deanxwhite.com",
+  "dean@deanxwhite.com"
 ];
 
-// Google Auth – service account
+// Google Auth (Service Account)
 const auth = new google.auth.JWT(
   process.env.GOOGLE_CLIENT_EMAIL,
   null,
@@ -22,84 +23,81 @@ const auth = new google.auth.JWT(
 const calendar = google.calendar({ version: "v3", auth });
 
 /* ----------------------------------------------------------
-   NORMALIZE GOOGLE EVENT OBJECT
-   - Handles date vs dateTime
-   - Strips links
+   CLEAN EVENT TEXT
 ---------------------------------------------------------- */
-function normalizeEvent(ev) {
-  // Strip links safely
-  const clean = (txt) =>
-    txt ? txt.replace(/https?:\/\/\S+/g, "") : "";
-
-  // Convert all-day events to usable dateTime
-  let start = ev.start.dateTime || ev.start.date;
-  let end   = ev.end.dateTime || ev.end.date;
-
-  // Convert date-only → add time component
-  if (ev.start.date && !ev.start.dateTime) {
-    start = `${ev.start.date}T00:00:00`;
-  }
-  if (ev.end.date && !ev.end.dateTime) {
-    end = `${ev.end.date}T23:59:59`;
-  }
-
+function sanitizeEvent(ev) {
+  const strip = (t) => (t ? t.replace(/https?:\/\/\\S+/g, "") : "");
   return {
     ...ev,
-    summary: clean(ev.summary),
-    description: clean(ev.description),
-    start: { dateTime: start },
-    end: { dateTime: end },
+    summary: strip(ev.summary),
+    description: strip(ev.description),
   };
 }
 
 /* ----------------------------------------------------------
-   GET EVENTS FOR A SPECIFIC DAY
+   GET ALL EVENTS FOR A DATE
 ---------------------------------------------------------- */
 export async function getEventsForDate(date) {
   const start = new Date(date);
-  start.setHours(0, 0, 0, 0);
-
   const end = new Date(date);
   end.setHours(23, 59, 59, 999);
-
   return await getEventsForRange(start, end);
 }
 
 /* ----------------------------------------------------------
-   MERGED EVENTS FROM ALL CALENDARS
+   GET MERGED EVENTS ACROSS ALL CALENDARS
 ---------------------------------------------------------- */
 export async function getEventsForRange(start, end) {
-  let events = [];
+  let merged = [];
 
-  for (const id of CALENDARS) {
-    try {
-      const res = await calendar.events.list({
-        calendarId: id,
-        timeMin: start.toISOString(),
-        timeMax: end.toISOString(),
-        singleEvents: true,
-        orderBy: "startTime",
+  for (const calId of CALENDARS) {
+    const res = await calendar.events.list({
+      calendarId: calId,
+      timeMin: start.toISOString(),
+      timeMax: end.toISOString(),
+      singleEvents: true,
+      orderBy: "startTime",
+    });
+
+    if (res.data.items) {
+      res.data.items.forEach((ev) => {
+        merged.push({
+          ...sanitizeEvent(ev),
+          _calendarId: calId, // Track origin calendar
+        });
       });
-
-      if (res.data.items) {
-        events.push(...res.data.items.map(normalizeEvent));
-      }
-    } catch (err) {
-      console.error(`Calendar fetch error for ${id}`, err);
     }
   }
 
-  // Sort merged list
-  events.sort(
-    (a, b) =>
-      new Date(a.start.dateTime) - new Date(b.start.dateTime)
+  // Sort chronologically
+  merged.sort(
+    (a, b) => new Date(a.start.dateTime) - new Date(b.start.dateTime)
   );
 
-  return events;
+  return merged;
 }
 
 /* ----------------------------------------------------------
-   FREE SLOT FINDER (08:00–22:00)
+   EVENT SEARCH BY TEXT (for cancel/reschedule)
+---------------------------------------------------------- */
+export async function searchEventsByText(query) {
+  const today = new Date();
+  const future = new Date();
+  future.setMonth(future.getMonth() + 3); // 90-day search window
+
+  const all = await getEventsForRange(today, future);
+
+  query = query.toLowerCase();
+
+  return all.filter((ev) => {
+    const summary = ev.summary?.toLowerCase() || "";
+    const desc = ev.description?.toLowerCase() || "";
+    return summary.includes(query) || desc.includes(query);
+  });
+}
+
+/* ----------------------------------------------------------
+   FIND FREE TIME BETWEEN 08:00–22:00
 ---------------------------------------------------------- */
 export async function findOpenSlots(date, duration, limit = 100) {
   const events = await getEventsForDate(date);
@@ -110,59 +108,75 @@ export async function findOpenSlots(date, duration, limit = 100) {
   const dayEnd = new Date(date);
   dayEnd.setHours(MAX_HOUR, 0, 0, 0);
 
-  const results = [];
-  let cursor = new Date(dayStart);
+  let free = [];
+  let cursor = dayStart;
 
   for (const ev of events) {
     const evStart = new Date(ev.start.dateTime);
     const evEnd = new Date(ev.end.dateTime);
 
+    // Check gap before event
     if (evStart - cursor >= duration * 60000) {
-      results.push({
+      free.push({
         start: new Date(cursor),
         end: new Date(cursor.getTime() + duration * 60000),
       });
     }
 
+    // Move cursor past this event
     if (evEnd > cursor) cursor = evEnd;
   }
 
-  // After last event → end of day
+  // Check gap at end of day
   if (dayEnd - cursor >= duration * 60000) {
-    results.push({
+    free.push({
       start: new Date(cursor),
       end: new Date(cursor.getTime() + duration * 60000),
     });
   }
 
-  return results.slice(0, limit);
+  return free.slice(0, limit);
 }
 
 /* ----------------------------------------------------------
-   CREATE EVENT (Always goes to main calendar)
+   CREATE EVENT (with attendee notification)
 ---------------------------------------------------------- */
 export async function createEvent({ title, start, end }) {
-  try {
-    const res = await calendar.events.insert({
-      calendarId: CALENDARS[0],
-      requestBody: {
-        summary: title,
-        start: {
-          dateTime: start.toISOString(),
-          timeZone: TIMEZONE,
-        },
-        end: {
-          dateTime: end.toISOString(),
-          timeZone: TIMEZONE,
-        },
-      },
-    });
+  return await calendar.events.insert({
+    calendarId: CALENDARS[0], // always main calendar
+    sendUpdates: "all",       // notify attendees
+    requestBody: {
+      summary: title,
+      start: { dateTime: start.toISOString(), timeZone: TIMEZONE },
+      end: { dateTime: end.toISOString(), timeZone: TIMEZONE },
+    },
+  });
+}
 
-    return res.data;
-  } catch (err) {
-    console.error("Create event error:", err);
-    return null;
-  }
+/* ----------------------------------------------------------
+   CANCEL EVENT COMPLETELY
+---------------------------------------------------------- */
+export async function cancelEventById(calendarId, eventId) {
+  return await calendar.events.delete({
+    calendarId,
+    eventId,
+    sendUpdates: "all", // notify attendees
+  });
+}
+
+/* ----------------------------------------------------------
+   RESCHEDULE EVENT (KEEP ATTENDEES)
+---------------------------------------------------------- */
+export async function rescheduleEventById(calendarId, eventId, newStart, newEnd) {
+  return await calendar.events.patch({
+    calendarId,
+    eventId,
+    sendUpdates: "all", // notify attendees
+    requestBody: {
+      start: { dateTime: newStart.toISOString(), timeZone: TIMEZONE },
+      end: { dateTime: newEnd.toISOString(), timeZone: TIMEZONE },
+    },
+  });
 }
 
 
