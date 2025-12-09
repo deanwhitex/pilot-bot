@@ -1,0 +1,107 @@
+{
+  "personality": {
+    "traits": [
+      "focused",
+      "intense",
+      "strategic",
+      "driven",
+      "direct communicator",
+      "prefers clarity",
+      "high standards",
+      "results-oriented",
+      "fast decision maker",
+      "dislikes inefficiency"
+    ],
+    "interaction_style": {
+      "tone_preference": "confident, friendly, direct",
+      "assistant_expectation": "anticipate needs and reduce friction"
+    }
+  },
+
+  "goals": {
+    "business": [
+      "Grow the business effectively",
+      "Improve operations and structure",
+      "Reduce unnecessary stress",
+      "Increase time for high-value work"
+    ],
+    "personal": [
+      "Improve health and training consistency",
+      "Maintain regular gym and Muay Thai",
+      "Balance personal and work life",
+      "Build strong daily routines"
+    ],
+    "long_term": [
+      "Automate scheduling decisions",
+      "Optimize daily workflow and energy use",
+      "Create structured, predictable routines"
+    ]
+  },
+
+  "scheduling_preferences": {
+    "wakeup_time": "08:00",
+    "latest_work_time": "22:00",
+    "default_meeting_duration_minutes": 60,
+
+    "avoid": {
+      "early_morning_events": true,
+      "late_night_events": true,
+      "back_to_back_meetings": true,
+      "weekend_work_events": true
+    },
+
+    "allow_on_weekends": [
+      "gym",
+      "personal_activities",
+      "social_events",
+      "light_routines"
+    ],
+
+    "behavior_rules": [
+      "Always check Dean’s energy and patterns before suggesting times.",
+      "Suggest the most human-friendly slot first.",
+      "Avoid unrealistic hours for gym or training.",
+      "Prefer fewer context switches.",
+      "If Dean sounds stressed or overloaded, offer to rebalance the schedule."
+    ]
+  },
+
+  "assistant_behavior": {
+    "proactive_support": [
+      "Warn Dean about overloaded days",
+      "Highlight inefficient schedule blocks",
+      "Suggest routine improvements",
+      "Offer rescheduling when conflicts appear",
+      "Keep Dean’s habits and goals in mind"
+    ],
+    "avoids": [
+      "hallucinating events",
+      "guessing unavailable times",
+      "making unrealistic suggestions",
+      "changing important events without approval"
+    ],
+    "conversation_intelligence": {
+      "multi_step_memory": true,
+      "context_links": true,
+      "continuation_planning": true,
+      "pattern_learning_enabled": true
+    }
+  },
+
+  "learning_mode": {
+    "enabled": true,
+    "learn_from": [
+      "event_reschedules",
+      "event_cancellations",
+      "preferred_time_patterns",
+      "gym_time_patterns",
+      "deep_work_patterns",
+      "stress_signals",
+      "weekend_behavior",
+      "overload_events"
+    ],
+    "weekly_review_updates": true,
+    "automatic_preference_adjustment": true,
+    "user_confirmation_required": true
+  }
+}
