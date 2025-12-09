@@ -1,235 +1,104 @@
-// index.js
+// index.js (FULL RESET — Reply to everything, stable scheduling)
 import "dotenv/config";
-import {
-  Client,
-  GatewayIntentBits,
-  Partials,
-  Events,
-} from "discord.js";
+import { Client, GatewayIntentBits, Partials } from "discord.js";
+import { handleUserMessage } from "./pilot.js";
 import cron from "node-cron";
-import fs from "fs";
-import ffmpeg from "fluent-ffmpeg";
-import ffmpegPath from "ffmpeg-static";
-import OpenAI from "openai";
+import { getEventsForDate } from "./calendar.js";
 
-import {
-  handleUserMessage,
-  detectIntentType,
-} from "./pilot.js";
-
-import {
-  getEventsForDate,
-} from "./calendar.js";
-
-// ---------------------------------------------
-// CONSTANTS
-// ---------------------------------------------
 const TIMEZONE = "Africa/Johannesburg";
 
-// CHANNEL ROUTING
-const CHANNEL_GENERAL = "1445737224879738945";      // pilot-general
-const CHANNEL_DAILY = "1445756413472280668";        // daily summary
-const CHANNEL_WEEKLY = "1448020304159969340";       // weekly planning
-
-// ---------------------------------------------
-// DISCORD CLIENT
-// ---------------------------------------------
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent,
-    GatewayIntentBits.GuildVoiceStates,
+    GatewayIntentBits.MessageContent
   ],
-  partials: [Partials.Message, Partials.Channel],
+  partials: [Partials.Channel]
 });
 
-client.once(Events.ClientReady, () => {
-  console.log(`🤖 Dean Pilot Online — Logged in as ${client.user.tag}`);
-  initSchedulers();
+client.once("ready", () => {
+  console.log(`🔥 Pilot is online as ${client.user.tag}`);
+  initDailySummary();
 });
 
-// ---------------------------------------------
-// OPENAI CLIENT (for voice notes)
-// ---------------------------------------------
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
+// ----------------------------------------------------------
+// 🌍 REPLY TO EVERYTHING ANYONE SAYS
+// ----------------------------------------------------------
+client.on("messageCreate", async (message) => {
+  if (message.author.bot) return; // ignore bots
 
-// ---------------------------------------------
-// MESSAGE HANDLING (NO DOUBLE REPLIES)
-// ---------------------------------------------
-// Bot replies to EVERYTHING from ANYONE (not just mentions)
-client.on(Events.MessageCreate, async (message) => {
   try {
-    // Ignore messages from itself
-    if (message.author.id === client.user.id) return;
+    const reply = await handleUserMessage(message.content);
 
-    // HANDLE VOICE NOTES
-    if (message.attachments.size > 0) {
-      const audioAttachment = message.attachments.find((att) =>
-        att.contentType?.includes("audio")
-      );
-
-      if (audioAttachment) {
-        const transcript = await transcribeAudio(audioAttachment.url);
-
-        if (!transcript) {
-          await safeReply(message, "Sorry Dean, I couldn’t process the voice note.");
-          return;
-        }
-
-        // Now treat transcript as the user's message
-        const response = await handleUserMessage(transcript);
-        await safeReply(message, response);
-        return;
-      }
-    }
-
-    // NORMAL TEXT MESSAGE
-    const text = message.content.trim();
-    if (!text) return;
-
-    const reply = await handleUserMessage(text);
-    await safeReply(message, reply);
+    await message.reply({
+      content: reply,
+      flags: ["SuppressEmbeds"] // hide link previews
+    });
 
   } catch (err) {
-    console.error("Message handler error:", err);
+    console.error("Pilot error:", err);
+    message.reply("Sorry Dean — something went wrong. 😕");
   }
 });
 
-// ---------------------------------------------
-// SAFE REPLY (NO EMBED PREVIEWS)
-// ---------------------------------------------
-async function safeReply(message, content) {
-  return message.reply({
-    content,
-    allowedMentions: { repliedUser: false },
-    flags: ["SuppressEmbeds"],
-  });
-}
+// ----------------------------------------------------------
+// DAILY 7AM SUMMARY — sends to DAILY channel
+// ----------------------------------------------------------
+function initDailySummary() {
+  const dailyChannelId = process.env.DAILY_CHANNEL_ID;
 
-// ---------------------------------------------
-// VOICE TRANSCRIPTION
-// ---------------------------------------------
-async function transcribeAudio(url) {
-  try {
-    const tmpFile = "./audio_tmp.wav";
-
-    await new Promise((resolve, reject) => {
-      ffmpeg(url)
-        .setFfmpegPath(ffmpegPath)
-        .output(tmpFile)
-        .on("end", resolve)
-        .on("error", reject)
-        .run();
-    });
-
-    const response = await openai.audio.transcriptions.create({
-      file: fs.createReadStream(tmpFile),
-      model: "whisper-1",
-      language: "en",
-    });
-
-    fs.unlinkSync(tmpFile);
-
-    return response.text;
-  } catch (err) {
-    console.error("Voice transcription error:", err);
-    return null;
+  if (!dailyChannelId) {
+    console.error("❌ DAILY_CHANNEL_ID missing from .env");
+    return;
   }
-}
 
-// ---------------------------------------------
-// SCHEDULERS
-// ---------------------------------------------
-function initSchedulers() {
-  // ---------------------------------------------
-  // DAILY SUMMARY — 08:00
-  // ---------------------------------------------
   cron.schedule(
-    "0 8 * * *",
+    "0 7 * * *",
     async () => {
       try {
-        const channel = await client.channels.fetch(CHANNEL_DAILY);
+        const channel = await client.channels.fetch(dailyChannelId);
         if (!channel) return;
 
         const today = new Date();
         const events = await getEventsForDate(today);
 
-        let msg = `🌅 **Good morning Dean! Here is your schedule for today (${today.toLocaleDateString(
+        let msg = `🌅 **Good morning Dean! Here's your schedule for today (${today.toLocaleDateString(
           "en-ZA"
         )}):**\n\n`;
 
         if (events.length === 0) {
-          msg += "You're completely free today 😎";
+          msg += "You're completely free today! 😎";
         } else {
           events.forEach((ev) => {
-            msg += `• **${ev.summary}** — ${formatTime(
+            msg += `• **${ev.summary.trim()}** — ${formatTime(
               ev.start.dateTime
-            )}\n`;
+            )} to ${formatTime(ev.end.dateTime)}\n`;
           });
         }
 
-        await channel.send({
+        channel.send({
           content: msg,
-          flags: ["SuppressEmbeds"],
+          flags: ["SuppressEmbeds"]
         });
+
       } catch (err) {
-        console.error("Daily summary error:", err);
-      }
-    },
-    { timezone: TIMEZONE }
-  );
-
-  // ---------------------------------------------
-  // WEEKLY PLANNING — Sunday 20:00
-  // ---------------------------------------------
-  cron.schedule(
-    "0 20 * * SUN",
-    async () => {
-      try {
-        const channel = await client.channels.fetch(CHANNEL_WEEKLY);
-        if (!channel) return;
-
-        const msg = `
-🧭 **Weekly Planning Reminder**
-
-Dean, it's Sunday evening — time to prepare for the week ahead.
-
-You can say:
-• **Plan my week with priorities**  
-• **Plan my week around energy**  
-• **Build a balanced week**  
-• **Show next week’s schedule**  
-`;
-
-        await channel.send({
-          content: msg,
-          flags: ["SuppressEmbeds"],
-        });
-      } catch (err) {
-        console.error("Weekly summary error:", err);
+        console.error("Daily Summary Error:", err);
       }
     },
     { timezone: TIMEZONE }
   );
 }
 
-// ---------------------------------------------
-// FORMATTING HELPERS
-// ---------------------------------------------
+// ----------------------------------------------------------
 function formatTime(date) {
   return new Date(date).toLocaleTimeString("en-ZA", {
     hour: "2-digit",
     minute: "2-digit",
-    timeZone: TIMEZONE,
+    timeZone: TIMEZONE
   });
 }
 
-// ---------------------------------------------
-// LOGIN
-// ---------------------------------------------
 client.login(process.env.DISCORD_TOKEN);
+
 
 
