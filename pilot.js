@@ -347,42 +347,43 @@ async function handleFindFree({ date, duration }) {
 }
 
 // -----------------------------------------------
-// DAY SUMMARY
+// DAY SUMMARY 
 // -----------------------------------------------
 async function handleDaySummary(date) {
-  const events = await getEventsForDate(date);
+  if (!date) return "Which date would you like me to check? 😊";
 
-  if (events.length === 0)
-    return `You’re free on **${formatDate(date)}** 😎`;
+  const d = new Date(date);
+  const events = await getEventsForDate(d);
 
-  let out = `📅 **Your schedule for ${formatDate(date)}:**\n\n`;
-  events.forEach((ev) => {
-    out += `• **${ev.summary}** — ${formatTime(
-      ev.start.dateTime
-    )}\n`;
-  });
-
-  return out;
+  return renderEventList(events, formatDate(d));
 }
 
+
 // -----------------------------------------------
-// RANGE SUMMARY
+// RANGE SUMMARY (Week/Month)
 // -----------------------------------------------
 async function handleRangeSummary(start, end) {
-  const events = await getEventsForRange(start, end);
+  if (!start || !end)
+    return "Which date range would you like me to check? 😊";
 
-  if (events.length === 0)
-    return `No events between ${formatDate(start)} and ${formatDate(end)}.`;
+  const s = new Date(start);
+  const e = new Date(end);
 
-  let out = `📆 **Your schedule from ${formatDate(start)} to ${formatDate(
-    end
-  )}:**\n\n`;
+  const events = await getEventsForRange(s, e);
 
-  events.forEach((ev) => {
-    out += `• **${ev.summary}** (${formatDate(ev.start.dateTime)} — ${formatTime(
+  if (events.length === 0) {
+    return `🎉 You have *no events* between **${formatDate(s)}** and **${formatDate(e)}**!`;
+  }
+
+  let out = `📆 **Your schedule from ${formatDate(s)} to ${formatDate(e)}:**\n\n`;
+
+  events.forEach((ev, i) => {
+    out += `${i + 1}. **${ev.summary.trim()}** — ${formatDate(
       ev.start.dateTime
-    )})\n`;
+    )} (${formatTime(ev.start.dateTime)}–${formatTime(ev.end.dateTime)})\n\n`;
   });
+
+  out += `Let me know if you'd like help planning the week! 😊`;
 
   return out;
 }
@@ -450,6 +451,23 @@ function formatTime(date) {
     minute: "2-digit",
     timeZone: TIMEZONE,
   });
+}
+function renderEventList(events, dateLabel = "") {
+  if (events.length === 0) {
+    return `Your schedule is *wide open* on **${dateLabel}** 😎`;
+  }
+
+  let out = `📅 **Your schedule for ${dateLabel}:**\n\n`;
+
+  events.forEach((ev, index) => {
+    out += `${index + 1}. **${ev.summary.trim()}** ${
+      ev.location ? `📍${ev.location}` : ""
+    } — ${formatTime(ev.start.dateTime)} to ${formatTime(ev.end.dateTime)}\n\n`;
+  });
+
+  out += `Let me know if you'd like changes, cancellations, or help planning the day! 😊`;
+
+  return out;
 }
 
 
