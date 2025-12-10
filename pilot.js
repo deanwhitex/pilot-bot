@@ -1,6 +1,5 @@
 // pilot.js
 import OpenAI from "openai";
-import fs from "fs";
 import {
   getEventsForDate,
   getEventsForRange,
@@ -11,109 +10,129 @@ import {
   searchEventsByText,
 } from "./calendar.js";
 
-// -----------------------------------------------
-// CONSTANTS / MEMORY
-// -----------------------------------------------
-const TIMEZONE = process.env.TZ || "Africa/Johannesburg";
-const DEFAULT_DURATION_MIN = 60;
-const MEMORY_FILE = "./memory.json";
-
-// very simple “personality” memory – you can expand later
-let memory = {
-  preferences: {
-    avoid_early_mornings: true,
-    meeting_buffer_min: 10,
-  },
-  energy_profile: {
-    morning: "medium",
-    afternoon: "high",
-    evening: "low",
-  },
-};
-
-try {
-  if (fs.existsSync(MEMORY_FILE)) {
-    memory = JSON.parse(fs.readFileSync(MEMORY_FILE, "utf8"));
-    console.log("🧠 Memory loaded.");
-  }
-} catch (err) {
-  console.error("Memory load error:", err);
-}
-
-function saveMemory() {
-  try {
-    fs.writeFileSync(MEMORY_FILE, JSON.stringify(memory, null, 2));
-  } catch (err) {
-    console.error("Memory save error:", err);
-  }
-}
-
-// -----------------------------------------------
-// OPENAI CLIENT
-// -----------------------------------------------
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// -----------------------------------------------
-// LIGHTWEIGHT STATE (for "number 3" after a list)
-// -----------------------------------------------
-let pendingCancelOptions = null; // array of events from last cancel search
+// “Human” hours for new events
+const TIMEZONE = process.env.TZ || "Africa/Johannesburg";
+const MIN_HOUR = 8;
+const MAX_HOUR = 22;
+const DEFAULT_DURATION_MIN = 60;
 
-// -----------------------------------------------
-// INTENT PARSER (LLM + hard rules)
-// -----------------------------------------------
+/* ------------------------------------------------------------------ */
+/*  Helpers                                                           */
+/* ------------------------------------------------------------------ */
+
+// Turn “today”, “tomorrow”, or a date string into a real Date
+function resolveDate(input) {
+  if (!input) return null;
+  const text = String(input).trim().toLowerCase();
+  const now = new Date();
+
+  if (text === "today") return now;
+
+  if (text === "tomorrow") {
+    const d = new Date(now);
+    d.setDate(d.getDate() + 1);
+    return d;
+  }
+
+  // Let JS try to parse e.g. 2025-12-11 or 11/12/2025 etc.
+  const parsed = new Date(input);
+  if (!isNaN(parsed.getTime())) return parsed;
+
+  return null;
+}
+
+// Time "10:00" → {hours: 10, minutes: 0}
+function parseTimeHM(str) {
+  if (!str) return null;
+  const m = String(str).match(/(\d{1,2}):?(\d{2})?/);
+  if (!m) return null;
+  const hours = parseInt(m[1], 10);
+  const minutes = m[2] ? parseInt(m[2], 10) : 0;
+  if (isNaN(hours) || isNaN(minutes)) return null;
+  return { hours, minutes };
+}
+
+// Format helpers (used in replies)
+function formatDate(date) {
+  return new Date(date).toLocaleDateString("en-ZA", { timeZone: TIMEZONE });
+}
+
+function formatTime(date) {
+  return new Date(date).toLocaleTimeString("en-ZA", {
+    hour: "2-digit",
+    minute: "2-digit",
+    timeZone: TIMEZONE,
+  });
+}
+
+// Nice list for “what’s my schedule”
+function renderEventList(events, label) {
+  if (!events.length) {
+    return `Your schedule is *wide open* on **${label}** 😎`;
+  }
+
+  let out = `📅 **Your schedule for ${label}:**\n\n`;
+
+  events.forEach((ev, i) => {
+    const start = formatTime(ev.start.dateTime || ev.start.date);
+    const end = formatTime(ev.end.dateTime || ev.end.date);
+    const location = ev.location ? ` 📍${ev.location}` : "";
+    out += `${i + 1}. **${(ev.summary || "").trim()}**${location} — ${start} to ${end}\n`;
+  });
+
+  out += `\nLet me know if you'd like changes, cancellations, or help planning the day! 😊`;
+  return out;
+}
+
+// Clean event-name search text (“gym?” → “gym”)
+function cleanSearchText(text) {
+  return String(text)
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, "") // remove punctuation
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/* ------------------------------------------------------------------ */
+/*  Intent detection (used by index.js only for routing if needed)    */
+/* ------------------------------------------------------------------ */
+
+export function isSchedulingMessage(message) {
+  const t = message.toLowerCase();
+  const keywords = [
+    "schedule",
+    "calendar",
+    "appointment",
+    "meeting",
+    "book",
+    "cancel",
+    "reschedule",
+    "move",
+    "slot",
+    "free time",
+    "open time",
+    "what's my day",
+    "what's my schedule",
+  ];
+  return keywords.some((k) => t.includes(k));
+}
+
+/* ------------------------------------------------------------------ */
+/*  LLM intent parser                                                 */
+/* ------------------------------------------------------------------ */
+
 async function interpretMessage(message) {
-  const lower = message.toLowerCase().trim();
-
-  // ---------- HARD RULES FIRST (no LLM) ----------
-
-  // 1) Pure greeting
-  if (/^(hi|hey|hello|yo|morning|evening)\b/.test(lower)) {
-    return {
-      intent: "assistant_chat",
-      title: "",
-      date: "",
-      start_time: "",
-      end_time: "",
-      duration: "",
-      range_start: "",
-      range_end: "",
-      target_event: "",
-    };
-  }
-
-  // 2) Hard rule: cancel something
-  if (lower.includes("cancel")) {
-    // grab everything after the word "cancel"
-    const after = message.replace(/.*cancel/i, "").trim();
-    return {
-      intent: "cancel_event",
-      title: "",
-      date: "",
-      start_time: "",
-      end_time: "",
-      duration: "",
-      range_start: "",
-      range_end: "",
-      target_event: after, // e.g. "sergio for tomorrow"
-    };
-  }
-
-  // 3) Hard rule: schedule / appointments / calendar → let LLM figure date
-  // (but bias towards day_summary)
-  // everything else falls through to LLM below
-
-  // ---------- LLM STRUCTURED INTENT ----------
   const prompt = `
-You are Dean’s AI scheduling assistant.
-
-Convert his message into STRICT JSON:
+You are Dean’s scheduling assistant.
+Convert his message into STRICT JSON (no extra text):
 
 {
   "intent": "",
   "title": "",
   "date": "",
   "start_time": "",
-  "end_time": "",
   "duration": "",
   "range_start": "",
   "range_end": "",
@@ -121,24 +140,31 @@ Convert his message into STRICT JSON:
 }
 
 INTENT OPTIONS:
-- "day_summary"        → what's on my schedule / day / calendar
-- "range_summary"      → week / month / between two dates
-- "find_free_time"     → free time, open slots, when can I
-- "create_event"       → add / book / schedule something
-- "reschedule_event"   → move / reschedule something
-- "cancel_event"       → cancel / remove an event
-- "assistant_chat"     → general chat / life talk
-- "unknown"            → if really unsure
+- "day_summary"        (what's on my schedule / my day)
+- "range_summary"      (week, month, between X and Y)
+- "find_free_time"     (find free/open time, slots)
+- "create_event"       (add/book/put something on calendar)
+- "cancel_event"       (cancel/delete/remove something)
+- "reschedule_event"   (move/change time)
+- "assistant_chat"     (small talk, hello, etc.)
+- "unknown"
 
-Rules:
-- Use ISO dates when possible (YYYY-MM-DD).
-- If user says things like "tomorrow", "Thursday", "next week",
-  convert to concrete dates if you can.
-- If unclear, prefer:
-    schedule → "day_summary"
-    planning-type talk → "assistant_chat"
-- NEVER include commentary, only valid JSON.
-User message: "${message}"
+RULES:
+- If the message is mostly about the calendar → choose a scheduling intent.
+- For "cancel" messages, set "target_event" to ONLY the event name
+  (e.g. "gym", "Record Youtube Video") – strip words like "cancel",
+  "please", and punctuation.
+- For "create_event":
+  - "title": short name, e.g. "Gym" or "Client Call"
+  - "date": either an ISO date (YYYY-MM-DD) OR "today" / "tomorrow"
+  - "start_time": HH:MM in 24h format if a time is given (e.g. "10:00")
+  - If no time is given, leave "start_time" as "".
+- For "day_summary": use "date" as ISO or "today"/"tomorrow".
+- For "range_summary": fill "range_start" and "range_end" (ISO or natural).
+- If you are not sure, set "intent" to "assistant_chat".
+
+USER MESSAGE:
+"${message}"
 `;
 
   const completion = await openai.chat.completions.create({
@@ -155,296 +181,109 @@ User message: "${message}"
   }
 }
 
-// -----------------------------------------------
-// MAIN ROUTER
-// -----------------------------------------------
+/* ------------------------------------------------------------------ */
+/*  Public entry point                                                */
+/* ------------------------------------------------------------------ */
+
 export async function handleUserMessage(message) {
-  const text = message.trim();
+  const intent = await interpretMessage(message);
 
-  // 0) If user says "number 3" etc and we recently listed cancel options
-  const lower = text.toLowerCase();
-  const numberMatch =
-    lower.match(/^number\s+(\d+)/) || lower.match(/^option\s+(\d+)/) || lower.match(/^(\d+)$/);
+  try {
+    switch (intent.intent) {
+      case "day_summary":
+        return await handleDaySummary(intent.date);
 
-  if (pendingCancelOptions && numberMatch) {
-    const idx = parseInt(numberMatch[1], 10) - 1;
-    if (idx < 0 || idx >= pendingCancelOptions.length) {
-      return "That number doesn’t match any option I gave you. Try again with a valid number. 🙂";
+      case "range_summary":
+        return await handleRangeSummary(intent.range_start, intent.range_end);
+
+      case "find_free_time":
+        return await handleFindFree(intent);
+
+      case "create_event":
+        return await handleCreateEvent(intent);
+
+      case "cancel_event":
+        return await handleCancel(intent);
+
+      case "reschedule_event":
+        return await handleReschedule(intent);
+
+      case "assistant_chat":
+        return friendlyChatReply(message);
+
+      default:
+        return "I'm not entirely sure what you mean, but I'm here to help! 😊";
     }
-
-    const ev = pendingCancelOptions[idx];
-    pendingCancelOptions = null; // clear state
-
-    try {
-      await cancelEventById(ev.calendarId, ev.id);
-      return `🗑️ Done — I’ve cancelled **${ev.summary}** on **${formatDate(
-        ev.start.dateTime || ev.start.date
-      )}** at **${formatTime(ev.start.dateTime || ev.start.date)}**.`;
-    } catch (err) {
-      console.error("Cancel by number error:", err);
-      return "I tried to cancel that event but something went wrong. 😕";
-    }
-  }
-
-  // 1) Normal intent flow
-  const intent = await interpretMessage(text);
-
-  // quick mood tweaks for memory
-  detectMood(text);
-
-  switch (intent.intent) {
-    case "assistant_chat":
-      return conversationalReply(text);
-
-    case "day_summary":
-      return await handleDaySummary(intent.date, text);
-
-    case "range_summary":
-      return await handleRangeSummary(intent.range_start, intent.range_end);
-
-    case "find_free_time":
-      return await handleFindFree(intent);
-
-    case "create_event":
-  return await handleCreateEvent(intent, message);
-
-    case "cancel_event":
-  return await handleCancel(intent, message);
-
-    case "reschedule_event":
-      return await handleReschedule(intent, text);
-
-    default:
-      // fallback: short, actionable hint rather than dumb waffle
-      return (
-        "I'm not totally sure what you mean, but I can help with things like:\n" +
-        "• *“What’s my day tomorrow?”*\n" +
-        "• *“Find a free hour on Friday”*\n" +
-        "• *“Add gym tomorrow at 9am”*\n" +
-        "• *“Cancel Sergio tomorrow”*"
-      );
+  } catch (err) {
+    console.error("handleUserMessage error:", err);
+    return "Sorry Dean, something went wrong while I was checking your schedule. 😕";
   }
 }
 
-// -----------------------------------------------
-// GREETING / CHAT MODE
-// -----------------------------------------------
-function conversationalReply(message) {
-  const lower = message.toLowerCase();
-  if (/^(hi|hey|hello|yo)/.test(lower)) {
-    return "Hey Dean! 😊 What do you want to do with your day — check your schedule, cancel something, or plan ahead?";
-  }
+/* ------------------------------------------------------------------ */
+/*  Chatty fallback                                                   */
+/* ------------------------------------------------------------------ */
 
-  return "Sure Dean — what's on your mind? I can help with your schedule, cancelling / moving meetings, or planning your week. 😊";
+function friendlyChatReply(message) {
+  return `Sure Dean — what can I help you with? 😊`;
 }
 
-// -----------------------------------------------
-// MOOD / MEMORY TWEAKS
-// -----------------------------------------------
-function detectMood(message) {
-  const text = message.toLowerCase();
+/* ------------------------------------------------------------------ */
+/*  Day & range summaries                                             */
+/* ------------------------------------------------------------------ */
 
-  if (text.includes("tired") || text.includes("exhausted")) {
-    memory.energy_profile.evening = "low";
-    saveMemory();
-  }
-
-  if (text.includes("stressed") || text.includes("overwhelmed")) {
-    memory.preferences.avoid_early_mornings = true;
-    saveMemory();
-  }
-}
-
-// -----------------------------------------------
-// CANCELLATION ENGINE (smarter)
-// -----------------------------------------------
-async function handleCancel(intent, originalText) {
-  let { target_event, date } = intent;
-  const lower = originalText.toLowerCase();
-
-  // Helper to normalise dates (today / tomorrow)
-  const now = new Date();
-  const isoToday = now.toISOString().split("T")[0];
-
-  const tmr = new Date(now);
-  tmr.setDate(tmr.getDate() + 1);
-  const isoTomorrow = tmr.toISOString().split("T")[0];
-
+async function handleDaySummary(dateText) {
+  const date = resolveDate(dateText || "today");
   if (!date) {
-    if (lower.includes("today")) date = isoToday;
-    else if (lower.includes("tomorrow")) date = isoTomorrow;
+    return "Which day should I check? You can say something like **today**, **tomorrow**, or **2025-12-11** 😊";
   }
 
-  // --------------------------------------------------
-  // Case 1: "cancel 3", "cancel number 3" etc.
-  // --------------------------------------------------
-  const numberMatch = lower.match(/cancel\s*(?:event\s*)?(?:number\s*)?(\d+)/);
-  if (numberMatch) {
-    const index = parseInt(numberMatch[1], 10) - 1;
+  const events = await getEventsForDate(date);
+  return renderEventList(events, formatDate(date));
+}
 
-    const dayIso = date || isoToday;
-    const dayEvents = await getEventsForDate(dayIso);
+async function handleRangeSummary(startText, endText) {
+  const start = resolveDate(startText);
+  const end = resolveDate(endText);
 
-    if (index < 0 || index >= dayEvents.length) {
-      return `I couldn't find event number ${index + 1} for ${formatDate(
-        dayIso
-      )}.`;
-    }
-
-    const ev = dayEvents[index];
-    await cancelEventById(ev.calendarId, ev.id);
-
-    return `🗑️ Done — I cancelled **${ev.summary.trim()}** on ${formatDate(
-      ev.start.dateTime
-    )} at ${formatTime(ev.start.dateTime)}.`;
+  if (!start || !end) {
+    return "Which date range should I check? For example: **this week**, or **2025-12-10 to 2025-12-17**.";
   }
 
-    // --------------------------------------------------
-  // Case 2: "cancel Sergio", "cancel the Youtube Video"
-  // --------------------------------------------------
-  if (!target_event) {
-    // remove "cancel" and common punctuation so we don't end up with "gym?"
-    target_event = originalText
-      .replace(/cancel/i, "")
-      .replace(/[?!.]/g, " ")
-      .trim();
+  const events = await getEventsForRange(start, end);
+
+  if (!events.length) {
+    return `No events between **${formatDate(start)}** and **${formatDate(end)}**. 🎉`;
   }
 
-  if (!target_event) return "Which event should I cancel?";
-
-  const matches = await searchEventsByText(target_event);
-
-  if (matches.length === 0) {
-    return `I couldn't find any events matching "${target_event}" in the next few weeks.`;
-  }
-
-  if (matches.length === 1) {
-    const m = matches[0];
-    await cancelEventById(m.calendarId, m.id);
-    return `🗑️ Done — I cancelled **${m.summary.trim()}** on ${formatDate(
-      m.start.dateTime
-    )} at ${formatTime(m.start.dateTime)}.`;
-  }
-
-  // Multiple matches – show a short list and tell Dean how to pick
-  let out = "I found several events that could match:\n\n";
-  matches.slice(0, 5).forEach((m, i) => {
-    out += `${i + 1}. **${m.summary.trim()}** — ${formatDate(
-      m.start.dateTime
-    )} ${formatTime(m.start.dateTime)}\n`;
+  let out = `📆 **Your schedule from ${formatDate(start)} to ${formatDate(end)}:**\n\n`;
+  events.forEach((ev) => {
+    const day = formatDate(ev.start.dateTime || ev.start.date);
+    const time = formatTime(ev.start.dateTime || ev.start.date);
+    out += `• **${(ev.summary || "").trim()}** — ${day} at ${time}\n`;
   });
-  out += "\nReply with `cancel 1`, `cancel 2`, etc. to pick one.";
 
   return out;
 }
 
-// -----------------------------------------------
-// RESCHEDULE (kept simple – exact time phrases work best)
-// -----------------------------------------------
-async function handleReschedule({ target_event, date, start_time }, originalMessage) {
-  if (!target_event) {
-    return "Which event should I move? For example: *“move Sergio to tomorrow 5pm”*.";
-  }
+/* ------------------------------------------------------------------ */
+/*  Free time                                                         */
+/* ------------------------------------------------------------------ */
 
-  const matches = await searchEventsByText(target_event);
-
-  if (matches.length === 0) {
-    return `I couldn’t find any events that look like **"${target_event}"**.`;
-  }
-
-  if (!date || !start_time) {
-    return "Right now I can reschedule only when you give me the new date *and* time, e.g. *“move Sergio to 2025-12-11 at 15:00”*.";
-  }
-
-  const ev = matches[0]; // simplest: take the best match
-  const newStart = new Date(`${date}T${start_time}`);
-  const newEnd = new Date(newStart.getTime() + DEFAULT_DURATION_MIN * 60000);
-
-  try {
-    await rescheduleEventById(ev.calendarId, ev.id, newStart, newEnd);
-    return `🔄 All set — I’ve moved **${ev.summary}** to **${formatDate(
-      newStart
-    )}**, **${formatTime(newStart)}–${formatTime(newEnd)}**.`;
-  } catch (err) {
-    console.error("Reschedule error:", err);
-    return "I tried to move that event but something went wrong. 😕";
-  }
-}
-
-// -----------------------------------------------
-// CREATE EVENT (uses human hours + error reporting)
-// -----------------------------------------------
-async function handleCreateEvent({ title, date, start_time, duration }, originalText) {
-  if (!title) return "What should I call this event?";
-
-  const now = new Date();
-  const isoToday = now.toISOString().split("T")[0];
-  const tmr = new Date(now);
-  tmr.setDate(tmr.getDate() + 1);
-  const isoTomorrow = tmr.toISOString().split("T")[0];
-
-  const lower = originalText.toLowerCase();
-
-  if (!date) {
-    if (lower.includes("today")) date = isoToday;
-    else if (lower.includes("tomorrow")) date = isoTomorrow;
-    else date = isoToday; // default to today if not specified
-  }
-
-  const dur = duration ? parseInt(duration) : DEFAULT_DURATION_MIN;
-
-  // If no explicit time: suggest slots instead of guessing
-  if (!start_time) {
-    const suggestions = await findOpenSlots(date, dur, 3);
-
-    if (suggestions.length === 0) {
-      return `I couldn't find any free ${dur}-minute slots on ${formatDate(
-        date
-      )}. Want me to check another day?`;
-    }
-
-    let out = `Here are good times for **${title}** on **${formatDate(
-      date
-    )}**:\n\n`;
-    suggestions.forEach((s, i) => {
-      out += `${i + 1}. ${formatTime(s.start)} – ${formatTime(s.end)}\n`;
-    });
-    out += "\nReply with `1`, `2`, or `3` and I'll book it.";
-    return out;
-  }
-
-  const start = new Date(`${date}T${start_time}`);
-  const end = new Date(start.getTime() + dur * 60000);
-
-  if (start.getHours() < MIN_HOUR || start.getHours() > MAX_HOUR) {
-    return "That time is outside your preferred hours (08:00–22:00).";
-  }
-
-  try {
-    const ev = await createEvent({ title, start, end });
-    return `🎉 Done — I’ve added **${title}** on **${formatDate(
-      start
-    )}** from ${formatTime(start)} to ${formatTime(end)}.`;
-  } catch (err) {
-    return `I tried to add that event but Google Calendar returned an error. Please double-check that the service account has *Make changes to events* on your main calendar. You can see the exact error in the Render logs.`;
-  }
-}
-
-
-// -----------------------------------------------
-// FREE TIME
-// -----------------------------------------------
 async function handleFindFree({ date, duration }) {
-  if (!date) return "Which date should I look at for free time?";
+  const baseDate = resolveDate(date || "today");
+  if (!baseDate) {
+    return "Which day should I look for free time on? 😊";
+  }
 
   const dur = duration ? parseInt(duration, 10) : DEFAULT_DURATION_MIN;
-  const slots = await findOpenSlots(date, dur);
+  const slots = await findOpenSlots(baseDate, dur);
 
-  if (slots.length === 0) {
-    return `No free ${dur}-minute slots on **${formatDate(date)}**. 😕`;
+  if (!slots.length) {
+    return `No free **${dur}-minute** slots on **${formatDate(baseDate)}** 😕`;
   }
 
-  let out = `🕒 **Your free ${dur}-minute slots on ${formatDate(date)}:**\n\n`;
+  let out = `🕒 **Available ${dur}-minute slots on ${formatDate(baseDate)}:**\n\n`;
   slots.forEach((s) => {
     out += `• ${formatTime(s.start)} – ${formatTime(s.end)}\n`;
   });
@@ -452,116 +291,171 @@ async function handleFindFree({ date, duration }) {
   return out;
 }
 
-// -----------------------------------------------
-// DAY SUMMARY (fixed so "today/tomorrow" use real dates)
-// -----------------------------------------------
-async function handleDaySummary(dateFromIntent, originalText) {
-  const lower = originalText.toLowerCase();
-  const now = new Date();
+/* ------------------------------------------------------------------ */
+/*  Create event (fixed)                                              */
+/* ------------------------------------------------------------------ */
 
-  const isoToday = now.toISOString().split("T")[0];
-
-  const tmr = new Date(now);
-  tmr.setDate(tmr.getDate() + 1);
-  const isoTomorrow = tmr.toISOString().split("T")[0];
-
-  const yest = new Date(now);
-  yest.setDate(yest.getDate() - 1);
-  const isoYesterday = yest.toISOString().split("T")[0];
-
-  let date = dateFromIntent; // what the model guessed
-
-  // 🔒 Hard override for natural phrases – ignore the model’s date
-  if (lower.includes("today")) {
-    date = isoToday;
-  } else if (lower.includes("tomorrow")) {
-    date = isoTomorrow;
-  } else if (lower.includes("yesterday")) {
-    date = isoYesterday;
-  } else if (!date) {
-    // no date from model → default to today
-    date = isoToday;
+async function handleCreateEvent({ title, date, start_time, duration }) {
+  if (!title) {
+    return "What should I call this event? (e.g. **Gym**, **Client Call**) 😊";
   }
 
-  // Extra sanity check:
-  // if the model gave a date > 1 year away and Dean didn't
-  // explicitly type a year, snap back to today.
-  try {
-    const parsed = new Date(date);
-    const diffDays = Math.abs((parsed - now) / (1000 * 60 * 60 * 24));
-    const userMentionedYear = /\b20\d{2}\b/.test(originalText);
+  const baseDate = resolveDate(date || "today");
+  if (!baseDate) {
+    return "Which day should I schedule that on? You can say **today**, **tomorrow**, or a specific date.";
+  }
 
-    if (diffDays > 365 && !userMentionedYear) {
-      date = isoToday;
+  const durMin = duration ? parseInt(duration, 10) : DEFAULT_DURATION_MIN;
+
+  // If no explicit time given → propose a few options
+  if (!start_time) {
+    const suggestions = await findOpenSlots(baseDate, durMin, 3);
+
+    if (!suggestions.length) {
+      return `I couldn't find any good ${durMin}-minute slots on **${formatDate(
+        baseDate
+      )}**. Want me to check another day?`;
     }
-  } catch {
-    date = isoToday;
+
+    let out = `Here are some good options for **${title}** on **${formatDate(
+      baseDate
+    )}**:\n\n`;
+    suggestions.forEach((s, i) => {
+      out += `${i + 1}. ${formatTime(s.start)} – ${formatTime(s.end)}\n`;
+    });
+    out += `\nReply with **1**, **2**, or **3** and I’ll book it.`;
+    return out;
   }
 
-  const events = await getEventsForDate(date);
-  return renderEventList(events, formatDate(date));
+  // We DO have a time, so create immediately
+  const hm = parseTimeHM(start_time);
+  if (!hm) {
+    return "I couldn't quite understand that time. Could you say it as **HH:MM**, like **10:00**?";
+  }
+
+  const start = new Date(baseDate);
+  start.setHours(hm.hours, hm.minutes, 0, 0);
+
+  const end = new Date(start.getTime() + durMin * 60 * 1000);
+
+  if (start.getHours() < MIN_HOUR || start.getHours() > MAX_HOUR) {
+    return `That’s outside your usual hours (${MIN_HOUR}:00–${MAX_HOUR}:00). Want to try a different time?`;
+  }
+
+  try {
+    const ev = await createEvent({ title, start, end });
+    return `🎉 All set! I added **${title}** on **${formatDate(
+      start
+    )}**, from **${formatTime(start)}** to **${formatTime(end)}**.`;
+  } catch (err) {
+    console.error("createEvent error:", err);
+    return "I tried to add that to your calendar, but something went wrong talking to Google. 😕";
+  }
 }
 
+/* ------------------------------------------------------------------ */
+/*  Cancel event (smarter)                                            */
+/* ------------------------------------------------------------------ */
 
-// -----------------------------------------------
-// RANGE SUMMARY
-// -----------------------------------------------
-async function handleRangeSummary(start, end) {
-  if (!start || !end) {
-    return "Which date range should I check? For example: *“my schedule next week”*.";
+async function handleCancel({ target_event }) {
+  if (!target_event) {
+    return "Which event would you like me to cancel? (e.g. **gym**, **Record Youtube Video**) 😊";
   }
 
-  const events = await getEventsForRange(start, end);
-
-  if (events.length === 0) {
-    return `No events between **${formatDate(start)}** and **${formatDate(end)}**. 🎉`;
+  const search = cleanSearchText(target_event);
+  if (!search) {
+    return "I couldn't quite tell which event you meant. Could you give me the event name, like **gym** or **NB CALL – Sergio**?";
   }
 
-  let out = `📆 **Your schedule from ${formatDate(start)} to ${formatDate(
-    end
-  )}:**\n\n`;
+  const matches = await searchEventsByText(search);
 
-  events.forEach((ev) => {
-    out += `• **${ev.summary}** — ${formatDate(
+  if (!matches.length) {
+    return `I couldn't find any events matching **"${search}"** in the next few weeks.`;
+  }
+
+  // Exactly one match → cancel directly
+  if (matches.length === 1) {
+    const ev = matches[0];
+    try {
+      await cancelEventById(ev.calendarId, ev.id);
+      return `🗑️ Done — I cancelled **${(ev.summary || "").trim()}** on **${formatDate(
+        ev.start.dateTime || ev.start.date
+      )}** at **${formatTime(ev.start.dateTime || ev.start.date)}**.`;
+    } catch (err) {
+      console.error("cancelEvent error:", err);
+      return "I found the event but couldn't cancel it due to an error talking to Google. 😕";
+    }
+  }
+
+  // Multiple candidates → list them
+  let out = "I found several events that might match. Which one should I cancel?\n\n";
+  matches.slice(0, 10).forEach((ev, i) => {
+    out += `${i + 1}. **${(ev.summary || "").trim()}** — ${formatDate(
       ev.start.dateTime || ev.start.date
-    )} (${formatTime(ev.start.dateTime || ev.start.date)})\n`;
+    )} at ${formatTime(ev.start.dateTime || ev.start.date)}\n`;
   });
+  out += `\nReply with the **number** of the one you want me to cancel.`;
 
   return out;
 }
 
-// -----------------------------------------------
-// HELPERS
-// -----------------------------------------------
-function formatDate(date) {
-  return new Date(date).toLocaleDateString("en-ZA", { timeZone: TIMEZONE });
-}
+/* ------------------------------------------------------------------ */
+/*  Reschedule (simple version – keeps behaviour but safe)            */
+/* ------------------------------------------------------------------ */
 
-function formatTime(date) {
-  return new Date(date).toLocaleTimeString("en-ZA", {
-    hour: "2-digit",
-    minute: "2-digit",
-    timeZone: TIMEZONE,
-  });
-}
-
-function renderEventList(events, dateLabel = "") {
-  if (!events || events.length === 0) {
-    return `Your schedule is **wide open** on **${dateLabel}** 😎`;
+async function handleReschedule({ target_event, date, start_time }) {
+  if (!target_event) {
+    return "Which event should I move? (e.g. **NB CALL – Sergio**) 😊";
   }
 
-  let out = `📅 **Your schedule for ${dateLabel}:**\n\n`;
+  const search = cleanSearchText(target_event);
+  const matches = await searchEventsByText(search);
 
-  events.forEach((ev, i) => {
-    out += `${i + 1}. **${ev.summary.trim()}**${
-      ev.location ? ` 📍${ev.location}` : ""
-    } — ${formatTime(ev.start.dateTime || ev.start.date)} to ${formatTime(
-      ev.end.dateTime || ev.end.date
-    )}\n`;
-  });
+  if (!matches.length) {
+    return `I couldn't find any events matching **"${search}"** in the next few weeks.`;
+  }
 
-  out += `\nLet me know if you'd like changes, cancellations, or help planning the day! 😊`;
-  return out;
+  // For now, if multiple matches, ask the user to be more specific
+  if (matches.length > 1) {
+    let out = "I found several events. Which one should I move?\n\n";
+    matches.slice(0, 10).forEach((ev, i) => {
+      out += `${i + 1}. **${(ev.summary || "").trim()}** — ${formatDate(
+        ev.start.dateTime || ev.start.date
+      )} at ${formatTime(ev.start.dateTime || ev.start.date)}\n`;
+    });
+    out += `\nReply with the **number** or rephrase with the exact title and date.`;
+    return out;
+  }
+
+  const ev = matches[0];
+
+  const baseDate = resolveDate(date || ev.start.dateTime || ev.start.date);
+  if (!baseDate) {
+    return "When would you like to move it to? (e.g. **tomorrow at 16:00**)";
+  }
+
+  if (!start_time) {
+    return "What time should I move it to? (e.g. **15:30**)";
+  }
+
+  const hm = parseTimeHM(start_time);
+  if (!hm) {
+    return "I couldn't understand that new time. Please say it like **14:00**.";
+  }
+
+  const newStart = new Date(baseDate);
+  newStart.setHours(hm.hours, hm.minutes, 0, 0);
+  const newEnd = new Date(newStart.getTime() + DEFAULT_DURATION_MIN * 60 * 1000);
+
+  try {
+    await rescheduleEventById(ev.calendarId, ev.id, newStart, newEnd);
+    return `🔄 Done — I’ve moved **${(ev.summary || "").trim()}** to **${formatDate(
+      newStart
+    )}** at **${formatTime(newStart)}**.`;
+  } catch (err) {
+    console.error("rescheduleEvent error:", err);
+    return "I found the event but couldn't move it due to an error talking to Google. 😕";
+  }
 }
 
 
