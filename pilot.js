@@ -209,7 +209,7 @@ export async function handleUserMessage(message) {
       return await handleCreateEvent(intent, text);
 
     case "cancel_event":
-      return await handleCancel(intent, text);
+  return await handleCancel(intent, message);
 
     case "reschedule_event":
       return await handleReschedule(intent, text);
@@ -256,50 +256,81 @@ function detectMood(message) {
 }
 
 // -----------------------------------------------
-// CANCEL EVENTS
+// CANCELLATION ENGINE (smarter)
 // -----------------------------------------------
-async function handleCancel({ target_event }, originalMessage) {
-  let query = (target_event || "").trim();
+async function handleCancel(intent, originalText) {
+  let { target_event, date } = intent;
+  const lower = originalText.toLowerCase();
 
-  // if LLM didn’t give us anything, fall back to text after "cancel"
-  if (!query) {
-    const m = originalMessage.split(/cancel/i)[1];
-    if (m) query = m.trim();
+  // Helper to normalise dates (today / tomorrow)
+  const now = new Date();
+  const isoToday = now.toISOString().split("T")[0];
+
+  const tmr = new Date(now);
+  tmr.setDate(tmr.getDate() + 1);
+  const isoTomorrow = tmr.toISOString().split("T")[0];
+
+  if (!date) {
+    if (lower.includes("today")) date = isoToday;
+    else if (lower.includes("tomorrow")) date = isoTomorrow;
   }
 
-  if (!query) {
-    return "Which event should I cancel? For example: *“cancel Sergio tomorrow”*.";
+  // --------------------------------------------------
+  // Case 1: "cancel 3", "cancel number 3" etc.
+  // --------------------------------------------------
+  const numberMatch = lower.match(/cancel\s*(?:event\s*)?(?:number\s*)?(\d+)/);
+  if (numberMatch) {
+    const index = parseInt(numberMatch[1], 10) - 1;
+
+    const dayIso = date || isoToday;
+    const dayEvents = await getEventsForDate(dayIso);
+
+    if (index < 0 || index >= dayEvents.length) {
+      return `I couldn't find event number ${index + 1} for ${formatDate(
+        dayIso
+      )}.`;
+    }
+
+    const ev = dayEvents[index];
+    await cancelEventById(ev.calendarId, ev.id);
+
+    return `🗑️ Done — I cancelled **${ev.summary.trim()}** on ${formatDate(
+      ev.start.dateTime
+    )} at ${formatTime(ev.start.dateTime)}.`;
   }
 
-  const matches = await searchEventsByText(query);
+  // --------------------------------------------------
+  // Case 2: "cancel Sergio", "cancel the Youtube Video"
+  // --------------------------------------------------
+  if (!target_event) {
+    // strip the word "cancel" and trim whatever is left
+    target_event = originalText.replace(/cancel/i, "").trim();
+  }
+
+  if (!target_event) return "Which event should I cancel?";
+
+  const matches = await searchEventsByText(target_event);
 
   if (matches.length === 0) {
-    return `I couldn’t find any events matching **"${query}"** in the next few weeks.`;
+    return `I couldn't find any events matching "${target_event}" in the next few weeks.`;
   }
 
   if (matches.length === 1) {
-    const ev = matches[0];
-    try {
-      await cancelEventById(ev.calendarId, ev.id);
-      return `🗑️ Done — I cancelled **${ev.summary}** on **${formatDate(
-        ev.start.dateTime || ev.start.date
-      )}** at **${formatTime(ev.start.dateTime || ev.start.date)}**.`;
-    } catch (err) {
-      console.error("Cancel single error:", err);
-      return "I found the event but couldn’t cancel it due to an error. 😕";
-    }
+    const m = matches[0];
+    await cancelEventById(m.calendarId, m.id);
+    return `🗑️ Done — I cancelled **${m.summary.trim()}** on ${formatDate(
+      m.start.dateTime
+    )} at ${formatTime(m.start.dateTime)}.`;
   }
 
-  // Multiple matches → store and ask user to pick a number
-  pendingCancelOptions = matches;
-
-  let out = `I found several events that match **"${query}"**:\n\n`;
-  matches.forEach((m, i) => {
-    out += `${i + 1}. **${m.summary}** — ${formatDate(
-      m.start.dateTime || m.start.date
-    )}, ${formatTime(m.start.dateTime || m.start.date)}\n`;
+  // Multiple matches – show a short list and tell Dean how to pick
+  let out = "I found several events that could match:\n\n";
+  matches.slice(0, 5).forEach((m, i) => {
+    out += `${i + 1}. **${m.summary.trim()}** — ${formatDate(
+      m.start.dateTime
+    )} ${formatTime(m.start.dateTime)}\n`;
   });
-  out += "\nReply with **the number** of the one you want me to cancel (for example: `7`).";
+  out += "\nReply with `cancel 1`, `cancel 2`, etc. to pick one.";
 
   return out;
 }
