@@ -7,36 +7,20 @@ import {
   findOpenSlots,
   createEvent,
   cancelEventById,
-  rescheduleEventById,
   searchEventsByText,
 } from "./calendar.js";
 
-// -----------------------------------------------
-// CONFIG & CONSTANTS
-// -----------------------------------------------
 const TIMEZONE = process.env.TZ || "Africa/Johannesburg";
-const MIN_HOUR = 8; // earliest “human” time
-const MAX_HOUR = 22; // latest “human” time
 const DEFAULT_DURATION_MIN = 60;
 const MEMORY_FILE = "./memory.json";
 
-// -----------------------------------------------
-// SIMPLE MEMORY (LOCAL FILE)
-// -----------------------------------------------
+// ----------------------------------------------------------
+// LIGHTWEIGHT "MEMORY" (preferences)
+// ----------------------------------------------------------
 let memory = {
   preferences: {
     avoid_early_mornings: true,
-    preferred_gym_time: "afternoon",
     meeting_buffer_min: 10,
-  },
-  patterns: {
-    gym_time: { morning: 0.1, afternoon: 0.8, evening: 0.1 },
-    focus_productivity: { morning: 0.6, afternoon: 0.4 },
-  },
-  energy_profile: {
-    morning: "medium",
-    afternoon: "high",
-    evening: "low",
   },
 };
 
@@ -57,107 +41,138 @@ function saveMemory() {
   }
 }
 
-// -----------------------------------------------
+// ----------------------------------------------------------
 // OPENAI CLIENT
-// -----------------------------------------------
+// ----------------------------------------------------------
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// -----------------------------------------------
-// TINY CONVERSATION STATE FOR NUMBERED CHOICES
-// -----------------------------------------------
-/**
- * Shape:
- * {
- *   type: "create_event_slots" | "cancel_event_choices",
- *   ...extra
- * }
- */
-let pendingChoice = null;
+// ----------------------------------------------------------
+// Simple per-user state for follow-ups
+// ----------------------------------------------------------
+// modes: "cancel_select", "create_select_slot"
+const sessions = new Map(); // userId -> { mode, ... }
 
-// -----------------------------------------------
-// LIGHTWEIGHT INTENT DETECTION (for index.js filters)
-// -----------------------------------------------
-export async function detectIntentType(message) {
-  const schedulingWords = [
-    "schedule",
-    "book",
-    "add",
-    "what's on",
-    "whats on",
-    "cancel",
-    "delete",
-    "move",
-    "reschedule",
-    "free time",
-    "slot",
-    "appointment",
-    "meeting",
-    "plan my week",
-    "plan my day",
-    "help me plan",
-    "calendar",
-  ];
-
-  const lower = message.toLowerCase();
-  return schedulingWords.some((w) => lower.includes(w));
+// ----------------------------------------------------------
+// Helpers
+// ----------------------------------------------------------
+function stripLinks(text = "") {
+  return text.replace(/https?:\/\/\S+/gi, "").trim();
 }
 
-// -----------------------------------------------
-// FULL INTENT PARSER (LLM → structured JSON)
-// -----------------------------------------------
-async function interpretMessage(message) {
-  const prompt = `
-You are Dean’s AI Chief-of-Staff and calendar assistant.
+function formatDate(d) {
+  return new Date(d).toLocaleDateString("en-ZA", {
+    timeZone: TIMEZONE,
+  });
+}
 
-Convert his message into STRICT JSON:
+function formatTime(d) {
+  return new Date(d).toLocaleTimeString("en-ZA", {
+    timeZone: TIMEZONE,
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+// Render schedule lists (also used by index.js)
+export function renderEventList(events, dateInput = null, opts = {}) {
+  const { includeHeader = true } = opts;
+  const label = dateInput ? formatDate(dateInput) : "this period";
+
+  if (!events || events.length === 0) {
+    return `Your schedule is *wide open* on **${label}** 😎`;
+  }
+
+  let out = "";
+  if (includeHeader) {
+    out += `📅 **Your schedule for ${label}:**\n\n`;
+  }
+
+  events.forEach((ev, i) => {
+    const title = stripLinks(ev.summary || "Untitled");
+    const start = formatTime(ev.start.dateTime || ev.start.date);
+    const end = formatTime(ev.end.dateTime || ev.end.date);
+    out += `${i + 1}. **${title}** — ${start} to ${end}\n`;
+  });
+
+  if (includeHeader) {
+    out +=
+      `\nLet me know if you'd like changes, cancellations, or help planning the day! 😊`;
+  }
+
+  return out;
+}
+
+// ----------------------------------------------------------
+// VERY LIGHT RULE-BASED HANDLING BEFORE LLM
+// ----------------------------------------------------------
+function isGreeting(text) {
+  const lower = text.toLowerCase();
+  return /^(hey|hi|hello|yo|morning|evening)\b/.test(lower);
+}
+
+function parseBasicDayRequest(text) {
+  const lower = text.toLowerCase();
+
+  // "schedule" or "calendar" must appear
+  if (!/(schedule|calendar|appointments?|day)/.test(lower)) return null;
+
+  const now = new Date();
+
+  if (/\btoday\b/.test(lower)) {
+    return { type: "day", date: now };
+  }
+
+  if (/\btomorrow\b/.test(lower)) {
+    const d = new Date(now);
+    d.setDate(d.getDate() + 1);
+    return { type: "day", date: d };
+  }
+
+  // yyyy/mm/dd style
+  const m = lower.match(/(\d{4}[-/]\d{2}[-/]\d{2})/);
+  if (m) {
+    const d = new Date(m[1]);
+    if (!isNaN(d.getTime())) {
+      return { type: "day", date: d };
+    }
+  }
+
+  return null;
+}
+
+// ----------------------------------------------------------
+// LLM intent parser (used only when rules don't handle it)
+// ----------------------------------------------------------
+async function interpretMessageLLM(text) {
+  const prompt = `
+You are Dean's scheduling assistant. Convert his message to *strict JSON*:
 
 {
   "intent": "",
   "title": "",
   "date": "",
   "start_time": "",
-  "end_time": "",
   "duration": "",
-  "range_start": "",
-  "range_end": "",
   "target_event": ""
 }
 
 INTENT OPTIONS:
-- "day_summary"        // what's on my schedule for X day
-- "range_summary"      // week/month overview
-- "find_free_time"     // find open slots
-- "create_event"       // add / book / schedule something
-- "cancel_event"       // cancel / delete a meeting
-- "reschedule_event"   // move / reschedule a meeting
-- "plan_day"           // help plan my day
-- "plan_week"          // help plan my week
-- "life_advice"        // general life / mindset / productivity question
-- "assistant_chat"     // small talk or general chat
+- "create_event" (add/book/schedule something)
+- "cancel_event" (cancel, remove, delete something)
+- "find_free_time"
+- "assistant_chat"
 - "unknown"
 
-RULES:
-- “what's on”, “what is on”, “my schedule”, “my calendar” → "day_summary" (if a specific day is mentioned, map it to "date")
-- “this week”, “next week”, “this month”, “next month” → "range_summary" with range_start / range_end
-- “add”, “book”, “schedule”, “put”, “create”, “block time” → "create_event"
-- “cancel”, “delete”, “remove” → "cancel_event" with target_event text
-- “move”, “reschedule”, “shift” → "reschedule_event" with target_event
-- “free time”, “open slot”, “when can I”, “when am I free” → "find_free_time"
-- “plan my day”, “plan today” → "plan_day"
-- “plan my week”, “weekly plan” → "plan_week"
-- If it's more about motivation, productivity, feelings, life advice → "life_advice"
-- Otherwise, use "assistant_chat"
-
-DATES:
-- Convert natural phrases like “today”, “tomorrow”, “Thursday”, “next week” into ISO dates or date ranges **when possible**.
-- date, range_start, and range_end should be "YYYY-MM-DD" when you can infer them.
-- duration should be minutes if provided (stringified number like "60").
-- If unsure about any field, leave it as an empty string.
-
-Return ONLY the JSON object, no explanation or extra text.
-
-USER MESSAGE:
-"${message}"
+Rules:
+- If he talks about adding/booking/scheduling -> "create_event"
+- If he says cancel/delete/remove -> "cancel_event"
+- If he says "free time", "open slot" -> "find_free_time"
+- If it's just chat or unclear -> "assistant_chat"
+- date: ISO (YYYY-MM-DD) when possible; otherwise "".
+- start_time: 24h HH:MM when specified, otherwise "".
+- duration: minutes as number string, default "60" for events.
+- NEVER add commentary, just the JSON.
+Message: "${text}"
 `;
 
   const completion = await openai.chat.completions.create({
@@ -168,461 +183,245 @@ USER MESSAGE:
 
   try {
     return JSON.parse(completion.choices[0].message.content);
-  } catch {
+  } catch (err) {
+    console.error("interpretMessageLLM JSON error:", err);
     return { intent: "unknown" };
   }
 }
 
-// -----------------------------------------------
-// MAIN ROUTER
-// -----------------------------------------------
+// ----------------------------------------------------------
+// PUBLIC ENTRYPOINT
+// ----------------------------------------------------------
 export async function handleUserMessage(message) {
-  const trimmed = message.trim();
+  const userId = message.author.id;
+  const text = message.content.trim();
 
-  // 1–9 numeric reply while we have a pending choice
-  if (/^[1-9]\d*$/.test(trimmed) && pendingChoice) {
-    const choice = parseInt(trimmed, 10);
-    return await handleNumericReply(choice);
+  // 1) If user is mid-flow (choosing a number for cancel/create), handle that
+  const pending = sessions.get(userId);
+  if (pending) {
+    return await handlePendingFlow(userId, pending, text);
   }
 
-  const intent = await interpretMessage(message);
+  // 2) Greetings – no LLM
+  if (isGreeting(text)) {
+    return "Sure Dean — what can I help you with? 😊";
+  }
 
-  // Mood & preference tweaks
-  detectMood(message);
+  // 3) Obvious schedule questions for today/tomorrow – no LLM
+  const basicDay = parseBasicDayRequest(text);
+  if (basicDay && basicDay.type === "day") {
+    const events = await getEventsForDate(basicDay.date);
+    return renderEventList(events, basicDay.date);
+  }
+
+  // 4) Everything else -> LLM intent
+  const intent = await interpretMessageLLM(text);
 
   switch (intent.intent) {
-    case "assistant_chat":
-      return conversationalReply(message);
-
-    case "plan_week":
-      return startWeeklyPlanning();
-
-    case "plan_day":
-      return await planMyDay(intent.date);
+    case "create_event":
+      return await handleCreateEvent(intent, userId);
 
     case "cancel_event":
-      return await handleCancel(intent);
-
-    case "reschedule_event":
-      return await handleReschedule(intent);
-
-    case "create_event":
-      return await handleCreateEvent(intent);
+      return await handleCancelEvent(intent, userId);
 
     case "find_free_time":
-      return await handleFindFree(intent);
+      return await handleFindFreeTime(intent);
 
-    case "day_summary":
-      return await handleDaySummary(intent.date);
-
-    case "range_summary":
-      return await handleRangeSummary(intent.range_start, intent.range_end);
-
-    case "life_advice":
-      return await lifeAdvice(message);
+    case "assistant_chat":
+      return "Sure Dean — what can I help you with? 😊";
 
     default:
-      return "I'm not entirely sure what you mean, but I’m here to help. 😊";
+      return "I'm not entirely sure what you mean, but I'm here to help. 😊";
   }
 }
 
-// -----------------------------------------------
-// HANDLE NUMERIC REPLIES (1 / 2 / 3 etc.)
-// -----------------------------------------------
-async function handleNumericReply(choice) {
-  const ctx = pendingChoice;
-  // Clear immediately so we don't reuse accidentally
-  pendingChoice = null;
+// ----------------------------------------------------------
+// FLOW HANDLERS (for follow-up numbers etc.)
+// ----------------------------------------------------------
+async function handlePendingFlow(userId, session, text) {
+  const choice = parseInt(text.trim(), 10);
 
-  if (!ctx) {
-    return "I wasn’t expecting a numbered choice right now, Dean. Tell me what you’d like to change or plan. 😊";
+  if (Number.isNaN(choice)) {
+    return "Please reply with the **number** of the option you'd like, e.g. `1`, `2`, or `3`.";
   }
 
-  switch (ctx.type) {
-    case "create_event_slots": {
-      const slot = ctx.slots[choice - 1];
-      if (!slot) {
-        return "That number doesn’t match any of the options I gave you. Please reply with one of the listed numbers.";
-      }
-
-      await createEvent({
-        title: ctx.title,
-        start: slot.start,
-        end: slot.end,
-      });
-
-      return `🎉 Done — I’ve added **${ctx.title}** on **${formatDate(
-        slot.start
-      )}**, from ${formatTime(slot.start)} to ${formatTime(slot.end)}.`;
+  if (session.mode === "cancel_select") {
+    const idx = choice - 1;
+    if (idx < 0 || idx >= session.events.length) {
+      return `That doesn't match any option. Please choose a number between 1 and ${session.events.length}.`;
     }
 
-    case "cancel_event_choices": {
-      const ev = ctx.matches[choice - 1];
-      if (!ev) {
-        return "That number doesn’t match any of the options I gave you. Please reply with one of the listed numbers.";
-      }
+    const ev = session.events[idx];
+    sessions.delete(userId);
 
-      await cancelEventById(ev.calendarId, ev.id);
+    await cancelEventById(ev.calendarId, ev.id);
+    return `🗑️ Done — I cancelled **${stripLinks(
+      ev.summary
+    )}** on **${formatDate(ev.start.dateTime || ev.start.date)}** at **${formatTime(
+      ev.start.dateTime || ev.start.date
+    )}**.`;
+  }
 
-      const startRaw = ev.start.dateTime || ev.start.date;
-      return `🗑️ Done — I cancelled **${ev.summary}** on **${formatDate(
-        startRaw
-      )}** at ${formatTime(startRaw)}.`;
+  if (session.mode === "create_select_slot") {
+    const idx = choice - 1;
+    if (idx < 0 || idx >= session.slots.length) {
+      return `That doesn't match any option. Please choose a number between 1 and ${session.slots.length}.`;
     }
 
-    default:
-      return "I wasn’t expecting a numbered choice there, but I’m here to help! Tell me what you’d like to change or plan. 😊";
-  }
-}
+    const slot = session.slots[idx];
+    sessions.delete(userId);
 
-// -----------------------------------------------
-// GREETING / CHAT MODE
-// -----------------------------------------------
-function conversationalReply(message) {
-  return `Sure Dean — what can I help you with? 😊`;
-}
+    const event = await createEvent({
+      title: session.title,
+      start: slot.start,
+      end: slot.end,
+    });
 
-// -----------------------------------------------
-// MOOD / PREFERENCE TWEAKS (very light)
-// -----------------------------------------------
-function detectMood(message) {
-  const text = message.toLowerCase();
-
-  if (text.includes("tired") || text.includes("exhausted")) {
-    memory.energy_profile.afternoon = "lower";
-    saveMemory();
+    return `🎉 All set! I added **${stripLinks(
+      event.summary
+    )}** on **${formatDate(
+      slot.start
+    )}** from **${formatTime(slot.start)}** to **${formatTime(slot.end)}**.`;
   }
 
-  if (text.includes("stressed") || text.includes("overwhelmed")) {
-    memory.preferences.avoid_early_mornings = true;
-    saveMemory();
-  }
+  // unknown mode – clear it
+  sessions.delete(userId);
+  return "Let's start fresh — what would you like me to help with?";
 }
 
-// -----------------------------------------------
-// CANCELLATION ENGINE
-// -----------------------------------------------
-async function handleCancel({ target_event }) {
-  if (!target_event) return "Which event should I cancel?";
+// ----------------------------------------------------------
+// CREATE EVENT
+// ----------------------------------------------------------
+async function handleCreateEvent(intent, userId) {
+  const title = intent.title?.trim() || "New event";
+  const duration =
+    intent.duration && !isNaN(parseInt(intent.duration, 10))
+      ? parseInt(intent.duration, 10)
+      : DEFAULT_DURATION_MIN;
 
-  const matches = await searchEventsByText(target_event);
+  // If no date, ask explicitly
+  if (!intent.date) {
+    return "Which date should I schedule that on? (e.g. `2025/12/11` or `tomorrow`)";
+  }
+
+  const date = new Date(intent.date);
+  if (isNaN(date.getTime())) {
+    return "I couldn't understand that date. Could you give it as `YYYY/MM/DD`?";
+  }
+
+  // If no time, suggest slots using findOpenSlots
+  if (!intent.start_time) {
+    const slots = await findOpenSlots(date, duration, 3);
+    if (slots.length === 0) {
+      return `I couldn't find any good ${duration}-minute slots on **${formatDate(
+        date
+      )}**. Want me to check another day?`;
+    }
+
+    sessions.set(userId, {
+      mode: "create_select_slot",
+      title,
+      slots,
+    });
+
+    let out = `Here are some good options for **${title}** on **${formatDate(
+      date
+    )}**:\n\n`;
+    slots.forEach((s, i) => {
+      out += `${i + 1}. ${formatTime(s.start)} – ${formatTime(s.end)}\n`;
+    });
+    out += `\nReply with **1**, **2**, or **3** and I’ll book it.`;
+    return out;
+  }
+
+  // Time provided → create directly
+  const start = new Date(`${intent.date}T${intent.start_time}`);
+  if (isNaN(start.getTime())) {
+    return "I couldn't parse that time. Try something like `10:00` or `14:30`.";
+  }
+  const end = new Date(start.getTime() + duration * 60 * 1000);
+
+  const event = await createEvent({ title, start, end });
+
+  return `🎉 All set! I added **${stripLinks(
+    event.summary
+  )}** on **${formatDate(
+    start
+  )}** from **${formatTime(start)}** to **${formatTime(end)}**.`;
+}
+
+// ----------------------------------------------------------
+// CANCEL EVENT
+// ----------------------------------------------------------
+async function handleCancelEvent(intent, userId) {
+  const target = intent.target_event?.trim();
+  if (!target) {
+    return "Which event should I cancel? You can say something like `cancel gym tomorrow`.";
+  }
+
+  const matches = await searchEventsByText(target);
 
   if (matches.length === 0) {
-    return `I couldn't find anything matching "${target_event}" in the next few weeks.`;
+    return `I couldn't find any events matching **"${target}"** in the next few weeks.`;
   }
 
   if (matches.length === 1) {
     const ev = matches[0];
     await cancelEventById(ev.calendarId, ev.id);
-    const startRaw = ev.start.dateTime || ev.start.date;
-
-    return `🗑️ Done — I cancelled **${ev.summary}** on **${formatDate(
-      startRaw
-    )}** at ${formatTime(startRaw)}.`;
+    return `🗑️ Done — I cancelled **${stripLinks(
+      ev.summary
+    )}** on **${formatDate(ev.start.dateTime || ev.start.date)}** at **${formatTime(
+      ev.start.dateTime || ev.start.date
+    )}**.`;
   }
 
-  // Multiple possible matches → store them and ask for number
-  pendingChoice = {
-    type: "cancel_event_choices",
-    matches,
-  };
-
-  let out = "I found several events that might match:\n\n";
-  matches.forEach((m, i) => {
-    const startRaw = m.start.dateTime || m.start.date;
-    out += `${i + 1}. **${m.summary}** — ${formatDate(
-      startRaw
-    )}, ${formatTime(startRaw)}\n`;
+  // Multiple → ask for number and remember
+  sessions.set(userId, {
+    mode: "cancel_select",
+    events: matches,
   });
-  out += "\nReply with the **number** of the one you want me to cancel.";
 
+  let out = `I found several events that might match. Which one should I cancel?\n\n`;
+  matches.forEach((ev, i) => {
+    out += `${i + 1}. **${stripLinks(
+      ev.summary
+    )}** — ${formatDate(ev.start.dateTime || ev.start.date)} at ${formatTime(
+      ev.start.dateTime || ev.start.date
+    )}\n`;
+  });
+  out += `\nReply with the **number** of the one you want me to cancel.`;
   return out;
 }
 
-// -----------------------------------------------
-// RESCHEDULING ENGINE (simple version)
-// -----------------------------------------------
-async function handleReschedule({ target_event, date, start_time }) {
-  if (!target_event) return "Which event should I reschedule?";
-
-  const matches = await searchEventsByText(target_event);
-
-  if (matches.length === 0) return "I couldn’t find that event in your upcoming schedule.";
-
-  if (matches.length > 1) {
-    let out = "I found several events. Which one should I move?\n\n";
-    matches.forEach((m, i) => {
-      const startRaw = m.start.dateTime || m.start.date;
-      out += `${i + 1}. **${m.summary}** — ${formatDate(
-        startRaw
-      )}, ${formatTime(startRaw)}\n`;
-    });
-    out += "\nReply with the number and then tell me the new time (this part is still simple).";
-    return out;
+// ----------------------------------------------------------
+// FIND FREE TIME
+// ----------------------------------------------------------
+async function handleFindFreeTime(intent) {
+  if (!intent.date) {
+    return "What date should I look for free time on?";
+  }
+  const date = new Date(intent.date);
+  if (isNaN(date.getTime())) {
+    return "I couldn't understand that date. Please use `YYYY/MM/DD` or `tomorrow`.";
   }
 
-  const event = matches[0];
+  const duration =
+    intent.duration && !isNaN(parseInt(intent.duration, 10))
+      ? parseInt(intent.duration, 10)
+      : DEFAULT_DURATION_MIN;
 
-  if (!date || !start_time) {
-    const startRaw = event.start.dateTime || event.start.date;
-    return `You want to move **${event.summary}** on **${formatDate(
-      startRaw
-    )}**. What date and time should I move it to?`;
-  }
-
-  const newStart = new Date(`${date}T${start_time}`);
-  const newEnd = new Date(newStart.getTime() + 60 * 60000);
-
-  await rescheduleEventById(event.calendarId, event.id, newStart, newEnd);
-
-  return `🔄 All set — I’ve rescheduled **${event.summary}** to **${formatDate(
-    newStart
-  )}** at ${formatTime(newStart)}.`;
-}
-
-// -----------------------------------------------
-// CREATE EVENT (smart slots + human hours)
-// -----------------------------------------------
-async function handleCreateEvent({ title, date, start_time, duration }) {
-  if (!title) return "What should I call this event? 😊";
-  if (!date) return "Which date should I schedule it on?";
-
-  const dur = duration ? parseInt(duration, 10) : DEFAULT_DURATION_MIN;
-
-  // If NO explicit time → suggest top 3 slots and wait for 1/2/3
-  if (!start_time) {
-    const suggestions = await findOpenSlots(date, dur, 3);
-
-    if (suggestions.length === 0) {
-      return `I couldn't find any good ${dur}-minute slots on **${formatDate(
-        date
-      )}**. Want me to check another day?`;
-    }
-
-    pendingChoice = {
-      type: "create_event_slots",
-      title,
-      date,
-      duration: dur,
-      slots: suggestions,
-    };
-
-    let out = `Here are some good options for **${title}** on **${formatDate(
-      date
-    )}**:\n\n`;
-    suggestions.forEach((s, i) => {
-      out += `${i + 1}. ${formatTime(s.start)} – ${formatTime(s.end)}\n`;
-    });
-    out += "\nReply with **1, 2, or 3** and I’ll book it.";
-
-    return out;
-  }
-
-  // If time was given → just create it
-  const start = new Date(`${date}T${start_time}`);
-  const end = new Date(start.getTime() + dur * 60000);
-
-  if (start.getHours() < MIN_HOUR || start.getHours() > MAX_HOUR) {
-    return "That time is outside your usual hours (08:00–22:00). Pick another time and I’ll book it. 😊";
-  }
-
-  await createEvent({ title, start, end });
-
-  return `🎉 Done — I’ve added **${title}** on **${formatDate(
-    start
-  )}**, from ${formatTime(start)} to ${formatTime(end)}.`;
-}
-
-// -----------------------------------------------
-// FREE TIME FINDER
-// -----------------------------------------------
-async function handleFindFree({ date, duration }) {
-  if (!date) return "Which date should I check for free time? 😊";
-
-  const dur = duration ? parseInt(duration, 10) : DEFAULT_DURATION_MIN;
-  const slots = await findOpenSlots(date, dur);
-
+  const slots = await findOpenSlots(date, duration);
   if (slots.length === 0) {
-    return `No free **${dur}-minute** slots on **${formatDate(
+    return `I couldn't find any free ${duration}-minute slots on **${formatDate(
       date
-    )}** 😕 Want me to check another day?`;
+    )}**.`;
   }
 
-  let out = `Here are your open **${dur}-minute** slots on **${formatDate(
+  let out = `Here are your free **${duration}-minute** slots on **${formatDate(
     date
   )}**:\n\n`;
   slots.forEach((s) => {
     out += `• ${formatTime(s.start)} – ${formatTime(s.end)}\n`;
   });
-
-  return out;
-}
-
-// -----------------------------------------------
-// DAY SUMMARY
-// -----------------------------------------------
-async function handleDaySummary(date) {
-  if (!date) return "Which date would you like me to check? 😊";
-
-  const events = await getEventsForDate(date);
-  return renderEventList(events, formatDate(date));
-}
-
-// -----------------------------------------------
-// RANGE SUMMARY
-// -----------------------------------------------
-async function handleRangeSummary(start, end) {
-  if (!start || !end)
-    return "Which date range would you like me to check, Dean?";
-
-  const events = await getEventsForRange(start, end);
-
-  if (events.length === 0) {
-    return `You have *no events* between **${formatDate(start)}** and **${formatDate(
-      end
-    )}** 🎉`;
-  }
-
-  let out = `📆 **Your schedule from ${formatDate(start)} to ${formatDate(
-    end
-  )}:**\n\n`;
-
-  events.forEach((ev) => {
-    const startRaw = ev.start.dateTime || ev.start.date;
-    const endRaw = ev.end.dateTime || ev.end.date;
-    out += `• **${ev.summary}** — ${formatDate(startRaw)} (${formatTime(
-      startRaw
-    )}–${formatTime(endRaw)})\n`;
-  });
-
-  return out;
-}
-
-// -----------------------------------------------
-// PLAN MY DAY (simple version using events)
-// -----------------------------------------------
-async function planMyDay(date) {
-  const target = date || new Date().toISOString().slice(0, 10);
-  const events = await getEventsForDate(target);
-
-  if (events.length === 0) {
-    return `You don't have anything booked on **${formatDate(
-      target
-    )}**. Want me to help you block focus time, gym, or rest?`;
-  }
-
-  const summaries = events
-    .map((e) => {
-      const startRaw = e.start.dateTime || e.start.date;
-      const endRaw = e.end.dateTime || e.end.date;
-      return `${e.summary} (${formatTime(startRaw)}–${formatTime(endRaw)})`;
-    })
-    .join("\n");
-
-  const prompt = `
-You are Dean's Chief-of-Staff.
-
-Here are his events for the day:
-${summaries}
-
-Create a short, practical plan for the day:
-- 3–5 key priorities
-- Where to put focus work
-- When to rest or reset
-- Anything to watch out for
-
-Be concise, clear and encouraging.
-`;
-
-  const completion = await openai.chat.completions.create({
-    model: "gpt-4o-mini",
-    messages: [{ role: "user", content: prompt }],
-  });
-
-  return `🧠 **Plan for ${formatDate(target)}**\n\n${completion.choices[0].message.content}`;
-}
-
-// -----------------------------------------------
-// WEEKLY PLANNING (intro message)
-// -----------------------------------------------
-function startWeeklyPlanning() {
-  return `
-🧠 **Weekly Planning**
-
-Great, Dean. Let's plan your week strategically.
-
-I’ll look at:
-• Workload  
-• Energy profile  
-• Gym patterns  
-• Personal time  
-• Focus sessions  
-• Meetings  
-• Boundaries  
-
-You can say things like:
-- "Plan my week with priorities"
-- "Plan my week around energy"
-- "Build a balanced week"
-`;
-}
-
-// -----------------------------------------------
-// LIFE ADVICE / PERSONAL ASSISTANT MODE
-// -----------------------------------------------
-async function lifeAdvice(message) {
-  const prompt = `
-You are Dean’s AI Chief-of-Staff and trusted advisor.
-He said: "${message}"
-
-Reply with:
-- Friendly tone
-- Efficient, concrete advice
-- Strategic insight
-- Encouraging but confident
-- Keep it fairly short (3–6 bullet points or short paragraphs)
-`;
-
-  const completion = await openai.chat.completions.create({
-    model: "gpt-4o-mini",
-    messages: [{ role: "user", content: prompt }],
-  });
-
-  return completion.choices[0].message.content;
-}
-
-// -----------------------------------------------
-// FORMATTING HELPERS
-// -----------------------------------------------
-function formatDate(date) {
-  return new Date(date).toLocaleDateString("en-ZA", { timeZone: TIMEZONE });
-}
-
-function formatTime(date) {
-  return new Date(date).toLocaleTimeString("en-ZA", {
-    hour: "2-digit",
-    minute: "2-digit",
-    timeZone: TIMEZONE,
-  });
-}
-
-function renderEventList(events, dateLabel = "") {
-  if (!events || events.length === 0) {
-    return `Your schedule is *wide open* on **${dateLabel}** 😎`;
-  }
-
-  let out = `📅 **Your schedule for ${dateLabel}:**\n\n`;
-
-  events.forEach((ev, index) => {
-    const startRaw = ev.start.dateTime || ev.start.date;
-    const endRaw = ev.end.dateTime || ev.end.date;
-
-    out += `${index + 1}. **${(ev.summary || "").trim()}** ${
-      ev.location ? `📍${ev.location}` : ""
-    } — ${formatTime(startRaw)} to ${formatTime(endRaw)}\n\n`;
-  });
-
-  out += `Let me know if you'd like changes, cancellations, or help planning the day! 😊`;
-
   return out;
 }
