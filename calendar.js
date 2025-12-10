@@ -49,7 +49,15 @@ function toISO(d) {
 }
 
 function sortByStart(a, b) {
-  return new Date(a.start.dateTime || a.start.date) - new Date(b.start.dateTime || b.start.date);
+  return (
+    new Date(a.start.dateTime || a.start.date) -
+    new Date(b.start.dateTime || b.start.date)
+  );
+}
+
+// Strip ALL http/https URLs from text so Zoom links never hit Discord
+function stripUrls(text) {
+  return text ? text.replace(/https?:\/\/\S+/g, "").trim() : "";
 }
 
 // -----------------------------------------------------------------------------
@@ -99,6 +107,13 @@ export async function getEventsForRange(startInput, endInput) {
       console.error(`Calendar list error for ${calId}:`, err.message || err);
     }
   }
+
+  // 🔧 NEW: sanitize summaries / descriptions to remove URLs (Zoom etc.)
+  allEvents = allEvents.map((e) => ({
+    ...e,
+    summary: stripUrls(e.summary),
+    description: stripUrls(e.description),
+  }));
 
   allEvents.sort(sortByStart);
   return allEvents;
@@ -230,7 +245,11 @@ export async function rescheduleEventById(
 // -----------------------------------------------------------------------------
 // SEARCH EVENTS BY TEXT (for cancel / reschedule flows)
 // -----------------------------------------------------------------------------
-export async function searchEventsByText(searchText, daysBack = 7, daysForward = 30) {
+export async function searchEventsByText(
+  searchText,
+  daysBack = 7,
+  daysForward = 30
+) {
   if (CALENDAR_IDS.length === 0) return [];
 
   const now = new Date();
@@ -244,11 +263,11 @@ export async function searchEventsByText(searchText, daysBack = 7, daysForward =
 
   const lower = searchText.toLowerCase();
   return events.filter((e) => {
-    const text =
-      `${e.summary || ""} ${e.description || ""}`.toLowerCase();
+    const text = `${e.summary || ""} ${e.description || ""}`.toLowerCase();
     return text.includes(lower);
   });
 }
+
 
 
 
