@@ -12,17 +12,19 @@ import {
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// “Human” hours for new events
 const TIMEZONE = process.env.TZ || "Africa/Johannesburg";
 const MIN_HOUR = 8;
 const MAX_HOUR = 22;
 const DEFAULT_DURATION_MIN = 60;
 
+// When we show a list for "which event should I cancel?",
+// we store the matches here so "2" can pick one.
+let lastCancelContext = null;
+
 /* ------------------------------------------------------------------ */
 /*  Helpers                                                           */
 /* ------------------------------------------------------------------ */
 
-// Turn “today”, “tomorrow”, or a date string into a real Date
 function resolveDate(input) {
   if (!input) return null;
   const text = String(input).trim().toLowerCase();
@@ -36,14 +38,12 @@ function resolveDate(input) {
     return d;
   }
 
-  // Let JS try to parse e.g. 2025-12-11 or 11/12/2025 etc.
   const parsed = new Date(input);
   if (!isNaN(parsed.getTime())) return parsed;
 
   return null;
 }
 
-// Time "10:00" → {hours: 10, minutes: 0}
 function parseTimeHM(str) {
   if (!str) return null;
   const m = String(str).match(/(\d{1,2}):?(\d{2})?/);
@@ -54,7 +54,6 @@ function parseTimeHM(str) {
   return { hours, minutes };
 }
 
-// Format helpers (used in replies)
 function formatDate(date) {
   return new Date(date).toLocaleDateString("en-ZA", { timeZone: TIMEZONE });
 }
@@ -67,7 +66,6 @@ function formatTime(date) {
   });
 }
 
-// Nice list for “what’s my schedule”
 function renderEventList(events, label) {
   if (!events.length) {
     return `Your schedule is *wide open* on **${label}** 😎`;
@@ -86,17 +84,16 @@ function renderEventList(events, label) {
   return out;
 }
 
-// Clean event-name search text (“gym?” → “gym”)
 function cleanSearchText(text) {
   return String(text)
     .toLowerCase()
-    .replace(/[^\p{L}\p{N}\s]/gu, "") // remove punctuation
+    .replace(/[^\p{L}\p{N}\s]/gu, "")
     .replace(/\s+/g, " ")
     .trim();
 }
 
 /* ------------------------------------------------------------------ */
-/*  Intent detection (used by index.js only for routing if needed)    */
+/*  Lightweight routing helper (used in index.js if needed)           */
 /* ------------------------------------------------------------------ */
 
 export function isSchedulingMessage(message) {
@@ -140,27 +137,25 @@ Convert his message into STRICT JSON (no extra text):
 }
 
 INTENT OPTIONS:
-- "day_summary"        (what's on my schedule / my day)
-- "range_summary"      (week, month, between X and Y)
-- "find_free_time"     (find free/open time, slots)
-- "create_event"       (add/book/put something on calendar)
-- "cancel_event"       (cancel/delete/remove something)
-- "reschedule_event"   (move/change time)
-- "assistant_chat"     (small talk, hello, etc.)
+- "day_summary"
+- "range_summary"
+- "find_free_time"
+- "create_event"
+- "cancel_event"
+- "reschedule_event"
+- "assistant_chat"
 - "unknown"
 
 RULES:
-- If the message is mostly about the calendar → choose a scheduling intent.
-- For "cancel" messages, set "target_event" to ONLY the event name
-  (e.g. "gym", "Record Youtube Video") – strip words like "cancel",
-  "please", and punctuation.
+- If the message is about the calendar → choose a scheduling intent.
+- For "cancel" messages, put ONLY the event name in "target_event"
+  (e.g. "gym", "Record Youtube Video") – strip words like "cancel" and punctuation.
 - For "create_event":
-  - "title": short name, e.g. "Gym" or "Client Call"
-  - "date": either an ISO date (YYYY-MM-DD) OR "today" / "tomorrow"
-  - "start_time": HH:MM in 24h format if a time is given (e.g. "10:00")
-  - If no time is given, leave "start_time" as "".
+  - "title": short name (e.g. "Gym", "Client Call")
+  - "date": ISO date or "today"/"tomorrow"
+  - "start_time": HH:MM if given
 - For "day_summary": use "date" as ISO or "today"/"tomorrow".
-- For "range_summary": fill "range_start" and "range_end" (ISO or natural).
+- For "range_summary": fill "range_start" and "range_end".
 - If you are not sure, set "intent" to "assistant_chat".
 
 USER MESSAGE:
@@ -182,13 +177,45 @@ USER MESSAGE:
 }
 
 /* ------------------------------------------------------------------ */
-/*  Public entry point                                                */
+/*  MAIN ENTRY POINT                                                  */
 /* ------------------------------------------------------------------ */
 
 export async function handleUserMessage(message) {
-  const intent = await interpretMessage(message);
+  const text = typeof message === "string" ? message : message?.text || "";
+  const trimmed = text.trim();
 
   try {
+    // 1) Handle numeric reply for a pending cancel (“1”, “2”, etc.)
+    if (/^[1-9]\d*$/.test(trimmed) &&
+        lastCancelContext &&
+        Array.isArray(lastCancelContext.matches) &&
+        lastCancelContext.matches.length) {
+
+      const index = parseInt(trimmed, 10) - 1;
+      const matches = lastCancelContext.matches;
+
+      if (index < 0 || index >= matches.length) {
+        lastCancelContext = null;
+        return "That number doesn't match any of the options I listed. Let's try again — which event should I cancel?";
+      }
+
+      const ev = matches[index];
+      lastCancelContext = null;
+
+      try {
+        await cancelEventById(ev.calendarId, ev.id);
+        return `🗑️ Done — I cancelled **${(ev.summary || "").trim()}** on **${formatDate(
+          ev.start.dateTime || ev.start.date
+        )}** at **${formatTime(ev.start.dateTime || ev.start.date)}**.`;
+      } catch (err) {
+        console.error("cancelEvent (selection) error:", err);
+        return "I found that event, but something went wrong talking to Google when I tried to cancel it. 😕";
+      }
+    }
+
+    // 2) Normal intent flow
+    const intent = await interpretMessage(text);
+
     switch (intent.intent) {
       case "day_summary":
         return await handleDaySummary(intent.date);
@@ -209,7 +236,7 @@ export async function handleUserMessage(message) {
         return await handleReschedule(intent);
 
       case "assistant_chat":
-        return friendlyChatReply(message);
+        return friendlyChatReply(text);
 
       default:
         return "I'm not entirely sure what you mean, but I'm here to help! 😊";
@@ -224,8 +251,8 @@ export async function handleUserMessage(message) {
 /*  Chatty fallback                                                   */
 /* ------------------------------------------------------------------ */
 
-function friendlyChatReply(message) {
-  return `Sure Dean — what can I help you with? 😊`;
+function friendlyChatReply(_message) {
+  return "Sure Dean — what can I help you with? 😊";
 }
 
 /* ------------------------------------------------------------------ */
@@ -235,7 +262,7 @@ function friendlyChatReply(message) {
 async function handleDaySummary(dateText) {
   const date = resolveDate(dateText || "today");
   if (!date) {
-    return "Which day should I check? You can say something like **today**, **tomorrow**, or **2025-12-11** 😊";
+    return "Which day should I check? You can say **today**, **tomorrow**, or a specific date like **2025-12-11** 😊";
   }
 
   const events = await getEventsForDate(date);
@@ -247,7 +274,7 @@ async function handleRangeSummary(startText, endText) {
   const end = resolveDate(endText);
 
   if (!start || !end) {
-    return "Which date range should I check? For example: **this week**, or **2025-12-10 to 2025-12-17**.";
+    return "Which date range should I check? For example: **2025-12-10 to 2025-12-17**.";
   }
 
   const events = await getEventsForRange(start, end);
@@ -292,7 +319,7 @@ async function handleFindFree({ date, duration }) {
 }
 
 /* ------------------------------------------------------------------ */
-/*  Create event (fixed)                                              */
+/*  Create event                                                      */
 /* ------------------------------------------------------------------ */
 
 async function handleCreateEvent({ title, date, start_time, duration }) {
@@ -307,7 +334,6 @@ async function handleCreateEvent({ title, date, start_time, duration }) {
 
   const durMin = duration ? parseInt(duration, 10) : DEFAULT_DURATION_MIN;
 
-  // If no explicit time given → propose a few options
   if (!start_time) {
     const suggestions = await findOpenSlots(baseDate, durMin, 3);
 
@@ -327,7 +353,6 @@ async function handleCreateEvent({ title, date, start_time, duration }) {
     return out;
   }
 
-  // We DO have a time, so create immediately
   const hm = parseTimeHM(start_time);
   if (!hm) {
     return "I couldn't quite understand that time. Could you say it as **HH:MM**, like **10:00**?";
@@ -343,7 +368,7 @@ async function handleCreateEvent({ title, date, start_time, duration }) {
   }
 
   try {
-    const ev = await createEvent({ title, start, end });
+    await createEvent({ title, start, end });
     return `🎉 All set! I added **${title}** on **${formatDate(
       start
     )}**, from **${formatTime(start)}** to **${formatTime(end)}**.`;
@@ -354,7 +379,7 @@ async function handleCreateEvent({ title, date, start_time, duration }) {
 }
 
 /* ------------------------------------------------------------------ */
-/*  Cancel event (smarter)                                            */
+/*  Cancel event (with selection memory)                              */
 /* ------------------------------------------------------------------ */
 
 async function handleCancel({ target_event }) {
@@ -370,12 +395,13 @@ async function handleCancel({ target_event }) {
   const matches = await searchEventsByText(search);
 
   if (!matches.length) {
+    lastCancelContext = null;
     return `I couldn't find any events matching **"${search}"** in the next few weeks.`;
   }
 
-  // Exactly one match → cancel directly
   if (matches.length === 1) {
     const ev = matches[0];
+    lastCancelContext = null;
     try {
       await cancelEventById(ev.calendarId, ev.id);
       return `🗑️ Done — I cancelled **${(ev.summary || "").trim()}** on **${formatDate(
@@ -387,7 +413,9 @@ async function handleCancel({ target_event }) {
     }
   }
 
-  // Multiple candidates → list them
+  // Multiple matches — store them and ask for a number
+  lastCancelContext = { matches };
+
   let out = "I found several events that might match. Which one should I cancel?\n\n";
   matches.slice(0, 10).forEach((ev, i) => {
     out += `${i + 1}. **${(ev.summary || "").trim()}** — ${formatDate(
@@ -400,7 +428,7 @@ async function handleCancel({ target_event }) {
 }
 
 /* ------------------------------------------------------------------ */
-/*  Reschedule (simple version – keeps behaviour but safe)            */
+/*  Reschedule (simple)                                               */
 /* ------------------------------------------------------------------ */
 
 async function handleReschedule({ target_event, date, start_time }) {
@@ -415,7 +443,6 @@ async function handleReschedule({ target_event, date, start_time }) {
     return `I couldn't find any events matching **"${search}"** in the next few weeks.`;
   }
 
-  // For now, if multiple matches, ask the user to be more specific
   if (matches.length > 1) {
     let out = "I found several events. Which one should I move?\n\n";
     matches.slice(0, 10).forEach((ev, i) => {
@@ -457,6 +484,7 @@ async function handleReschedule({ target_event, date, start_time }) {
     return "I found the event but couldn't move it due to an error talking to Google. 😕";
   }
 }
+
 
 
 
