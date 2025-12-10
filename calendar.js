@@ -168,7 +168,7 @@ export async function findOpenSlots(dateInput, durationMinutes, limit = 100) {
 }
 
 // -----------------------------------------------------------------------------
-// CREATE EVENT (always primary / first calendar)
+// CREATE EVENT (always primary / first calendar) – with logging
 // -----------------------------------------------------------------------------
 export async function createEvent({ title, start, end, description, location }) {
   if (CALENDAR_IDS.length === 0) {
@@ -177,25 +177,41 @@ export async function createEvent({ title, start, end, description, location }) 
 
   const primaryId = CALENDAR_IDS[0];
 
-  const res = await calendar.events.insert({
-    calendarId: primaryId,
-    requestBody: {
-      summary: title,
-      description: description || "",
-      location: location || undefined,
-      start: {
-        dateTime: start.toISOString(),
-        timeZone: TIMEZONE,
+  try {
+    const res = await calendar.events.insert({
+      calendarId: primaryId,
+      requestBody: {
+        summary: title,
+        description: description || "",
+        location: location || undefined,
+        start: {
+          dateTime: start.toISOString(),
+          timeZone: TIMEZONE,
+        },
+        end: {
+          dateTime: end.toISOString(),
+          timeZone: TIMEZONE,
+        },
       },
-      end: {
-        dateTime: end.toISOString(),
-        timeZone: TIMEZONE,
-      },
-    },
-  });
+    });
 
-  const ev = res.data;
-  return { ...ev, calendarId: primaryId };
+    const ev = res.data;
+    console.log(
+      "✅ createEvent ok:",
+      ev.id,
+      "on",
+      primaryId,
+      "at",
+      ev.start?.dateTime
+    );
+    return { ...ev, calendarId: primaryId };
+  } catch (err) {
+    console.error(
+      "❌ createEvent error:",
+      err?.response?.data || err.message || err
+    );
+    throw err;
+  }
 }
 
 // -----------------------------------------------------------------------------
