@@ -259,7 +259,7 @@ export async function rescheduleEventById(
 }
 
 // -----------------------------------------------------------------------------
-// SEARCH EVENTS BY TEXT (for cancel / reschedule flows) – now fuzzy
+// SEARCH EVENTS BY TEXT (for cancel / reschedule flows) – fuzzy + punctuation-safe
 // -----------------------------------------------------------------------------
 export async function searchEventsByText(
   searchText,
@@ -277,10 +277,17 @@ export async function searchEventsByText(
 
   const events = await getEventsForRange(start, end);
 
-  const lower = (searchText || "").toLowerCase().trim();
-  if (!lower) return [];
+  // Normalise text: lowercase, remove most punctuation, condense spaces
+  const normalize = (str = "") =>
+    str
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
 
-  // Words that don't help matching
+  const normalizedSearch = normalize(searchText);
+  if (!normalizedSearch) return [];
+
   const stopwords = new Set([
     "the",
     "a",
@@ -301,26 +308,33 @@ export async function searchEventsByText(
     "reschedule",
     "book",
     "schedule",
+    "can",
+    "you",
+    "on",
+    "at",
+    "tomorrow",
+    "today",
   ]);
 
-  return events.filter((e) => {
-    const text = `${e.summary || ""} ${e.description || ""}`.toLowerCase();
+  const searchTokens = normalizedSearch
+    .split(" ")
+    .filter((t) => t && !stopwords.has(t));
 
-    // 1) direct substring
-    if (text.includes(lower)) return true;
+  return events.filter((e) => {
+    const raw = `${e.summary || ""} ${e.description || ""}`;
+    const text = normalize(raw); // "gym", "record youtube video", etc.
+
+    // 1) direct substring match on the normalised phrase
+    if (text.includes(normalizedSearch)) return true;
+
+    if (searchTokens.length === 0) return false;
 
     // 2) token-based fuzzy match:
-    //    "cancel the youtube video" → ["youtube","video"]
-    const tokens = lower
-      .split(/\s+/)
-      .filter((t) => t && !stopwords.has(t));
-
-    if (tokens.length === 0) return false;
-
-    // require all tokens to appear somewhere in the event text
-    return tokens.every((tok) => text.includes(tok));
+    //    "can you cancel gym?" → ["gym"]
+    return searchTokens.every((tok) => text.includes(tok));
   });
 }
+
 
 
 
