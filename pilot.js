@@ -206,7 +206,7 @@ export async function handleUserMessage(message) {
       return await handleFindFree(intent);
 
     case "create_event":
-      return await handleCreateEvent(intent, text);
+  return await handleCreateEvent(intent, message);
 
     case "cancel_event":
   return await handleCancel(intent, message);
@@ -369,45 +369,64 @@ async function handleReschedule({ target_event, date, start_time }, originalMess
 }
 
 // -----------------------------------------------
-// CREATE EVENT
+// CREATE EVENT (uses human hours + error reporting)
 // -----------------------------------------------
-async function handleCreateEvent({ title, date, start_time, duration }, originalMessage) {
-  if (!title) return "What should I call the event? 🙂";
-  if (!date) return "Which date should I schedule it on?";
+async function handleCreateEvent({ title, date, start_time, duration }, originalText) {
+  if (!title) return "What should I call this event?";
 
-  const durMin = duration ? parseInt(duration, 10) : DEFAULT_DURATION_MIN;
+  const now = new Date();
+  const isoToday = now.toISOString().split("T")[0];
+  const tmr = new Date(now);
+  tmr.setDate(tmr.getDate() + 1);
+  const isoTomorrow = tmr.toISOString().split("T")[0];
 
-  // If no explicit time, find a free slot
-  if (!start_time) {
-    const slots = await findOpenSlots(date, durMin, 3);
+  const lower = originalText.toLowerCase();
 
-    if (slots.length === 0) {
-      return `I couldn't find a good ${durMin}-minute slot on **${formatDate(
-        date
-      )}**. Want to try another day?`;
-    }
-
-    const best = slots[0];
-    const event = await createEvent({
-      title,
-      start: best.start,
-      end: best.end,
-    });
-
-    return `🎉 Done — I added **${title}** on **${formatDate(
-      best.start
-    )}**, **${formatTime(best.start)}–${formatTime(best.end)}**.`;
+  if (!date) {
+    if (lower.includes("today")) date = isoToday;
+    else if (lower.includes("tomorrow")) date = isoTomorrow;
+    else date = isoToday; // default to today if not specified
   }
 
-  // Explicit time
-  const start = new Date(`${date}T${start_time}`);
-  const end = new Date(start.getTime() + durMin * 60000);
+  const dur = duration ? parseInt(duration) : DEFAULT_DURATION_MIN;
 
-  const event = await createEvent({ title, start, end });
-  return `🎉 Done — I added **${title}** on **${formatDate(
-    start
-  )}**, **${formatTime(start)}–${formatTime(end)}**.`;
+  // If no explicit time: suggest slots instead of guessing
+  if (!start_time) {
+    const suggestions = await findOpenSlots(date, dur, 3);
+
+    if (suggestions.length === 0) {
+      return `I couldn't find any free ${dur}-minute slots on ${formatDate(
+        date
+      )}. Want me to check another day?`;
+    }
+
+    let out = `Here are good times for **${title}** on **${formatDate(
+      date
+    )}**:\n\n`;
+    suggestions.forEach((s, i) => {
+      out += `${i + 1}. ${formatTime(s.start)} – ${formatTime(s.end)}\n`;
+    });
+    out += "\nReply with `1`, `2`, or `3` and I'll book it.";
+    return out;
+  }
+
+  const start = new Date(`${date}T${start_time}`);
+  const end = new Date(start.getTime() + dur * 60000);
+
+  if (start.getHours() < MIN_HOUR || start.getHours() > MAX_HOUR) {
+    return "That time is outside your preferred hours (08:00–22:00).";
+  }
+
+  try {
+    const ev = await createEvent({ title, start, end });
+    return `🎉 Done — I’ve added **${title}** on **${formatDate(
+      start
+    )}** from ${formatTime(start)} to ${formatTime(end)}.`;
+  } catch (err) {
+    return `I tried to add that event but Google Calendar returned an error. Please double-check that the service account has *Make changes to events* on your main calendar. You can see the exact error in the Render logs.`;
+  }
 }
+
 
 // -----------------------------------------------
 // FREE TIME
