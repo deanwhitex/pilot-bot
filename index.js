@@ -1,16 +1,20 @@
-// index.js – Pilot wiring + 8am daily summary for current day
-
+// index.js
 import "dotenv/config";
-import { Client, GatewayIntentBits } from "discord.js";
+import {
+  Client,
+  GatewayIntentBits,
+  MessageFlags,
+} from "discord.js";
 import cron from "node-cron";
 import { handleUserMessage } from "./pilot.js";
 import { getEventsForDate } from "./calendar.js";
 
 const TIMEZONE = process.env.TZ || "Africa/Johannesburg";
 
-// ----------------------------------------------------------
-// DISCORD CLIENT
-// ----------------------------------------------------------
+/* ------------------------------------------------------------------ */
+/* DISCORD CLIENT */
+/* ------------------------------------------------------------------ */
+
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -19,56 +23,85 @@ const client = new Client({
   ],
 });
 
-// ----------------------------------------------------------
-// READY
-// ----------------------------------------------------------
 client.once("ready", () => {
   console.log(`🔥 Pilot is online as ${client.user.tag}`);
   initSchedulers();
 });
 
-// ----------------------------------------------------------
-// MESSAGE HANDLER – reply to everything (except bots)
-// ----------------------------------------------------------
+/* ------------------------------------------------------------------ */
+/* MESSAGE HANDLER – SINGLE REPLY, NO DUPLICATES */
+/* ------------------------------------------------------------------ */
+
 client.on("messageCreate", async (message) => {
-  if (message.author.bot) return;
-
   try {
-    const reply = await handleUserMessage(message.content);
+    // Ignore bots (including Pilot himself)
+    if (message.author.bot) return;
 
-    if (!reply || reply.trim() === "") return;
+    const raw = message.content ?? "";
+
+    // Strip THIS bot's mention from the message text (in case they tag him)
+    let cleaned = raw;
+    if (client.user && client.user.id) {
+      const mentionRegex = new RegExp(`<@!?${client.user.id}>`, "g");
+      cleaned = raw.replace(mentionRegex, "").trim();
+    } else {
+      cleaned = raw.trim();
+    }
+
+    const textForAI = cleaned || raw.trim();
+
+    // If there's literally no text (e.g. just an image), don't reply
+    if (!textForAI) return;
+
+    // 🔥 ALWAYS reply to human messages (no “isMentioned / looksScheduling” gating)
+    const replyText = await handleUserMessage(textForAI);
+
+    // Don't send empty replies
+    if (!replyText || !replyText.trim()) return;
 
     await message.reply({
-      content: reply,
-      // no embeds; links are already stripped in calendar.js
-      allowedMentions: { repliedUser: false },
+      content: replyText,
+      flags: MessageFlags.SuppressEmbeds, // no link previews
     });
   } catch (err) {
-    console.error("Message handler error:", err);
+    console.error("messageCreate error:", err);
     try {
-      await message.reply("Sorry Dean, something went wrong. 😕");
-    } catch (_) {}
+      await message.reply({
+        content:
+          "Sorry Dean, I ran into a problem while looking at that. 😕",
+        flags: MessageFlags.SuppressEmbeds,
+      });
+    } catch {
+      // ignore secondary failures
+    }
   }
 });
 
-// ----------------------------------------------------------
-// SCHEDULERS
-// ----------------------------------------------------------
+/* ------------------------------------------------------------------ */
+/* DAILY SUMMARY – 08:00 LOCAL TIME */
+/* ------------------------------------------------------------------ */
+
 function initSchedulers() {
-  const dailyChannelId = process.env.CHANNEL_DAILY;
+  const dailyChannelId =
+    process.env.CHANNEL_DAILY ||
+    process.env.DAILY_CHANNEL_ID ||
+    process.env.DAILY_CHANNEL;
+
   if (!dailyChannelId) {
-    console.error("❌ CHANNEL_DAILY is not set – daily summary disabled.");
+    console.warn(
+      "⚠️ No CHANNEL_DAILY / DAILY_CHANNEL_ID set – skipping daily summary."
+    );
     return;
   }
 
-  // 8:00 AM every day – summary for TODAY
+  // 08:00 every day
   cron.schedule(
     "0 8 * * *",
     async () => {
       try {
         const channel = await client.channels.fetch(dailyChannelId);
         if (!channel) {
-          console.error("❌ Could not find daily summary channel.");
+          console.warn("⚠️ Daily summary channel not found.");
           return;
         }
 
@@ -79,25 +112,27 @@ function initSchedulers() {
           timeZone: TIMEZONE,
         });
 
-        let msg = `🌅 **Good morning, Dean! Here's your schedule for today (${dateLabel}):**\n\n`;
+        let msg = "";
 
-        if (!events || events.length === 0) {
-          msg += "You’re completely free today 😎\n";
+        if (!events.length) {
+          msg = `🌅 **Good morning Dean!**\nYour schedule is *wide open* today (${dateLabel}). 😎`;
         } else {
-          events.forEach((ev, i) => {
-            msg += `${i + 1}. **${(ev.summary || "").trim()}** ${
-              ev.location ? `📍${ev.location}` : ""
-            } — ${formatTime(ev.start.dateTime)} to ${formatTime(
-              ev.end.dateTime
-            )}\n`;
-          });
+          msg = `🌅 **Good morning Dean! Here's your schedule for today (${dateLabel}):**\n\n`;
 
-          msg += `\nLet me know if you want to cancel, move, or add anything. 😊`;
+          events.forEach((ev, index) => {
+            const title = stripLinks(ev.summary || "Untitled").trim();
+            const start = ev.start.dateTime || ev.start.date;
+            const end = ev.end.dateTime || ev.end.date;
+
+            msg += `${index + 1}. **${title}** — ${formatTime(
+              start
+            )} to ${formatTime(end)}\n`;
+          });
         }
 
         await channel.send({
           content: msg,
-          allowedMentions: { repliedUser: false },
+          flags: MessageFlags.SuppressEmbeds, // no Zoom / link previews
         });
       } catch (err) {
         console.error("Daily summary error:", err);
@@ -109,9 +144,15 @@ function initSchedulers() {
   console.log("⏰ Schedulers initialized (daily 08:00 summary).");
 }
 
-// ----------------------------------------------------------
-// HELPERS
-// ----------------------------------------------------------
+/* ------------------------------------------------------------------ */
+/* SMALL HELPERS */
+/* ------------------------------------------------------------------ */
+
+function stripLinks(text) {
+  // Remove any visible URLs so Discord can't create cards
+  return text ? text.replace(/https?:\/\/\S+/gi, "") : "";
+}
+
 function formatTime(date) {
   return new Date(date).toLocaleTimeString("en-ZA", {
     hour: "2-digit",
@@ -120,10 +161,12 @@ function formatTime(date) {
   });
 }
 
-// ----------------------------------------------------------
-// LOGIN
-// ----------------------------------------------------------
+/* ------------------------------------------------------------------ */
+/* LOGIN */
+/* ------------------------------------------------------------------ */
+
 client.login(process.env.DISCORD_TOKEN);
+
 
 
 
