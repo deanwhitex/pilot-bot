@@ -243,7 +243,7 @@ export async function rescheduleEventById(
 }
 
 // -----------------------------------------------------------------------------
-// SEARCH EVENTS BY TEXT (for cancel / reschedule flows)
+// SEARCH EVENTS BY TEXT (for cancel / reschedule flows) – now fuzzy
 // -----------------------------------------------------------------------------
 export async function searchEventsByText(
   searchText,
@@ -261,12 +261,51 @@ export async function searchEventsByText(
 
   const events = await getEventsForRange(start, end);
 
-  const lower = searchText.toLowerCase();
+  const lower = (searchText || "").toLowerCase().trim();
+  if (!lower) return [];
+
+  // Words that don't help matching
+  const stopwords = new Set([
+    "the",
+    "a",
+    "an",
+    "to",
+    "for",
+    "with",
+    "my",
+    "me",
+    "please",
+    "call",
+    "meeting",
+    "appointment",
+    "slot",
+    "event",
+    "cancel",
+    "move",
+    "reschedule",
+    "book",
+    "schedule",
+  ]);
+
   return events.filter((e) => {
     const text = `${e.summary || ""} ${e.description || ""}`.toLowerCase();
-    return text.includes(lower);
+
+    // 1) direct substring
+    if (text.includes(lower)) return true;
+
+    // 2) token-based fuzzy match:
+    //    "cancel the youtube video" → ["youtube","video"]
+    const tokens = lower
+      .split(/\s+/)
+      .filter((t) => t && !stopwords.has(t));
+
+    if (tokens.length === 0) return false;
+
+    // require all tokens to appear somewhere in the event text
+    return tokens.every((tok) => text.includes(tok));
   });
 }
+
 
 
 
