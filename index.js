@@ -1,116 +1,140 @@
 // index.js
 import "dotenv/config";
-import {
-  Client,
-  GatewayIntentBits,
-  Partials,
-  Events,
-  MessageFlags,
-} from "discord.js";
+import { Client, GatewayIntentBits, Partials } from "discord.js";
 import cron from "node-cron";
 import { handleUserMessage } from "./pilot.js";
 import { getEventsForDate } from "./calendar.js";
 
+// ---------------------------------------------------------------------------
+// CONFIG
+// ---------------------------------------------------------------------------
 const TIMEZONE = process.env.TZ || "Africa/Johannesburg";
+const CHANNEL_DAILY = process.env.CHANNEL_DAILY;   // daily 08:00 summary
 
-// ----------------------------------------------------------
+// ---------------------------------------------------------------------------
 // DISCORD CLIENT
-// ----------------------------------------------------------
+// ---------------------------------------------------------------------------
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
+    GatewayIntentBits.DirectMessages,
   ],
   partials: [Partials.Channel],
 });
 
-client.once(Events.ClientReady, () => {
+client.once("ready", () => {
   console.log(`🔥 Pilot is online as ${client.user.tag}`);
   initSchedulers();
 });
 
-// ----------------------------------------------------------
-// MESSAGE HANDLER – reply to ANY human message (no mention needed)
-// ----------------------------------------------------------
-client.on(Events.MessageCreate, async (message) => {
+// ---------------------------------------------------------------------------
+// MESSAGE HANDLER – EXACTLY ONE REPLY PER HUMAN MESSAGE
+// ---------------------------------------------------------------------------
+client.on("messageCreate", async (message) => {
   try {
-    // ignore other bots (including itself)
+    // ignore other bots (including Pilot itself)
     if (message.author.bot) return;
 
-    const text = message.content.trim();
+    const text = message.content?.trim();
     if (!text) return;
 
     // Ask Pilot what to say
-    const response = await handleUserMessage(text);
-    if (!response || !response.trim()) return;
+    const replyText = await handleUserMessage(text);
 
-    await message.reply({
-      content: response,
-      // No embeds / Zoom previews
-      flags: [MessageFlags.SuppressEmbeds],
-      allowedMentions: { repliedUser: false },
-    });
-  } catch (err) {
-    console.error("Message handler error:", err);
+    // If Pilot returns nothing, do nothing
+    if (!replyText || !replyText.trim()) return;
+
+    // Send reply
+    const sent = await message.reply({ content: replyText });
+
+    // Suppress ugly link previews (Zoom etc.)
     try {
-      await message.reply(
-        "Sorry Dean, something went wrong while I was checking your schedule. 😕"
-      );
+      if (sent && typeof sent.suppressEmbeds === "function") {
+        await sent.suppressEmbeds(true);
+      }
+    } catch (err) {
+      console.warn("Failed to suppress embeds:", err.message || err);
+    }
+  } catch (err) {
+    console.error("messageCreate error:", err);
+    try {
+      await message.reply("Sorry Dean, something went wrong. 😕");
     } catch {
-      // ignore secondary errors
+      // ignore secondary failure
     }
   }
 });
 
-// ----------------------------------------------------------
-// DAILY SUMMARY – 08:00 every day in CHANNEL_DAILY
-// ----------------------------------------------------------
+// ---------------------------------------------------------------------------
+// DAILY SUMMARY SCHEDULER – 08:00 LOCAL TIME
+// ---------------------------------------------------------------------------
 function initSchedulers() {
-  const dailyChannelId =
-    process.env.CHANNEL_DAILY || process.env.DAILY_CHANNEL_ID;
-
-  if (!dailyChannelId) {
-    console.warn(
-      "⚠️ No CHANNEL_DAILY / DAILY_CHANNEL_ID set – daily summary disabled."
-    );
+  if (!CHANNEL_DAILY) {
+    console.warn("⚠️ CHANNEL_DAILY not set; skipping daily summary scheduler.");
     return;
   }
 
+  // 08:00 every day
   cron.schedule(
     "0 8 * * *",
     async () => {
       try {
-        const channel = await client.channels.fetch(dailyChannelId);
+        const channel = await client.channels.fetch(CHANNEL_DAILY);
         if (!channel) {
-          console.warn("⚠️ Could not find daily channel:", dailyChannelId);
+          console.warn("⚠️ Could not find daily channel:", CHANNEL_DAILY);
           return;
         }
 
         const today = new Date();
         const events = await getEventsForDate(today);
-        const dateLabel = today.toISOString().slice(0, 10).replace(/-/g, "/");
+
+        const label = today.toLocaleDateString("en-ZA", {
+          timeZone: TIMEZONE,
+        });
 
         let msg;
-        if (!events || events.length === 0) {
-          msg = `🌅 Good morning Dean! Your schedule is *wide open* today (${dateLabel}). 😎`;
+
+        if (!events.length) {
+          msg = `🌅 **Good morning Dean!**\n\nYour schedule is *wide open* today (**${label}**). 😎`;
         } else {
-          msg = `🌅 Good morning Dean! Here's your schedule for today (${dateLabel}):\n\n`;
-          events.forEach((ev, idx) => {
-            msg += `${idx + 1}. **${ev.summary.trim()}**${
-              ev.location ? ` 📍${ev.location}` : ""
-            } — ${formatTime(ev.start.dateTime)} to ${formatTime(
-              ev.end.dateTime
-            )}\n`;
+          msg = `🌅 **Good morning Dean! Here's your schedule for today (${label}):**\n\n`;
+
+          events.forEach((ev, i) => {
+            const startRaw = ev.start.dateTime || ev.start.date;
+            const endRaw = ev.end.dateTime || ev.end.date;
+
+            const startStr = new Date(startRaw).toLocaleTimeString("en-ZA", {
+              hour: "2-digit",
+              minute: "2-digit",
+              timeZone: TIMEZONE,
+            });
+
+            const endStr = new Date(endRaw).toLocaleTimeString("en-ZA", {
+              hour: "2-digit",
+              minute: "2-digit",
+              timeZone: TIMEZONE,
+            });
+
+            const location = ev.location ? ` 📍${ev.location}` : "";
+
+            msg += `${i + 1}. **${(ev.summary || "").trim()}**${location} — ${startStr} to ${endStr}\n`;
           });
-          msg +=
-            `\nLet me know if you'd like changes, cancellations, or help planning the day! 😊`;
+
+          msg += `\nLet me know if you'd like changes, cancellations, or help planning the day! 😊`;
         }
 
-        await channel.send({
-          content: msg,
-          flags: [MessageFlags.SuppressEmbeds],
-        });
+        const sent = await channel.send(msg);
+
+        // Suppress previews in the daily summary too
+        try {
+          if (sent && typeof sent.suppressEmbeds === "function") {
+            await sent.suppressEmbeds(true);
+          }
+        } catch (err) {
+          console.warn("Failed to suppress embeds on daily summary:", err.message || err);
+        }
       } catch (err) {
         console.error("Daily summary error:", err);
       }
@@ -121,25 +145,7 @@ function initSchedulers() {
   console.log("⏰ Schedulers initialized (daily 08:00 summary).");
 }
 
-// ----------------------------------------------------------
-// TIME FORMAT HELPER
-// ----------------------------------------------------------
-function formatTime(date) {
-  return new Date(date).toLocaleTimeString("en-ZA", {
-    hour: "2-digit",
-    minute: "2-digit",
-    timeZone: TIMEZONE,
-  });
-}
-
-// ----------------------------------------------------------
+// ---------------------------------------------------------------------------
 // LOGIN
-// ----------------------------------------------------------
+// ---------------------------------------------------------------------------
 client.login(process.env.DISCORD_TOKEN);
-
-
-
-
-
-
-
