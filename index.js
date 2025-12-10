@@ -1,27 +1,26 @@
 // index.js
 import "dotenv/config";
-import { Client, GatewayIntentBits, Partials } from "discord.js";
+import { Client, GatewayIntentBits } from "discord.js";
 import cron from "node-cron";
-import { handleUserMessage } from "./pilot.js";
-import { getEventsForDate } from "./calendar.js";
+import { handleUserMessage, renderEventList } from "./pilot.js";
+import { getEventsForDate, getEventsForRange } from "./calendar.js";
 
-// ---------------------------------------------------------------------------
-// CONFIG
-// ---------------------------------------------------------------------------
 const TIMEZONE = process.env.TZ || "Africa/Johannesburg";
-const CHANNEL_DAILY = process.env.CHANNEL_DAILY;   // daily 08:00 summary
 
-// ---------------------------------------------------------------------------
+// Channel IDs (from Render env)
+const CHANNEL_GENERAL = process.env.CHANNEL_GENERAL;
+const CHANNEL_DAILY = process.env.CHANNEL_DAILY;
+const CHANNEL_WEEKLY = process.env.CHANNEL_WEEKLY;
+
+// ----------------------------------------------------------
 // DISCORD CLIENT
-// ---------------------------------------------------------------------------
+// ----------------------------------------------------------
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
-    GatewayIntentBits.DirectMessages,
   ],
-  partials: [Partials.Channel],
 });
 
 client.once("ready", () => {
@@ -29,123 +28,125 @@ client.once("ready", () => {
   initSchedulers();
 });
 
-// ---------------------------------------------------------------------------
-// MESSAGE HANDLER – EXACTLY ONE REPLY PER HUMAN MESSAGE
-// ---------------------------------------------------------------------------
+// ----------------------------------------------------------
+// SINGLE MESSAGE HANDLER (no duplicates)
+// ----------------------------------------------------------
 client.on("messageCreate", async (message) => {
   try {
-    // ignore other bots (including Pilot itself)
+    // 1) Never reply to ourselves
     if (message.author.bot) return;
 
-    const text = message.content?.trim();
-    if (!text) return;
-
-    // Ask Pilot what to say
-    const replyText = await handleUserMessage(text);
-
-    // If Pilot returns nothing, do nothing
-    if (!replyText || !replyText.trim()) return;
-
-    // Send reply
-    const sent = await message.reply({ content: replyText });
-
-    // Suppress ugly link previews (Zoom etc.)
-    try {
-      if (sent && typeof sent.suppressEmbeds === "function") {
-        await sent.suppressEmbeds(true);
-      }
-    } catch (err) {
-      console.warn("Failed to suppress embeds:", err.message || err);
+    // 2) Optionally restrict to calendar channels only
+    const allowedChannels = new Set(
+      [CHANNEL_GENERAL, CHANNEL_DAILY, CHANNEL_WEEKLY].filter(Boolean)
+    );
+    if (allowedChannels.size && !allowedChannels.has(message.channelId)) {
+      // Ignore messages in other channels
+      return;
     }
+
+    // 3) Ask pilot.js what to say
+    const replyText = await handleUserMessage(message);
+
+    // If pilot.js returns null/empty, don't reply
+    if (!replyText) return;
+
+    // 4) Exactly ONE reply per message
+    await message.reply({
+      content: replyText,
+      // Suppress link previews by default
+      flags: 1 << 2, // SuppressEmbeds bit
+    });
   } catch (err) {
     console.error("messageCreate error:", err);
     try {
-      await message.reply("Sorry Dean, something went wrong. 😕");
+      await message.reply(
+        "Sorry Dean, something went wrong while I was processing that. 😕"
+      );
     } catch {
-      // ignore secondary failure
+      /* ignore */
     }
   }
 });
 
-// ---------------------------------------------------------------------------
-// DAILY SUMMARY SCHEDULER – 08:00 LOCAL TIME
-// ---------------------------------------------------------------------------
+// ----------------------------------------------------------
+// SCHEDULERS (Daily & Weekly)
+// ----------------------------------------------------------
 function initSchedulers() {
-  if (!CHANNEL_DAILY) {
-    console.warn("⚠️ CHANNEL_DAILY not set; skipping daily summary scheduler.");
-    return;
+  console.log("⏰ Schedulers initialized.");
+
+  // --- Daily schedule for TODAY at 08:00 local time ---
+  if (CHANNEL_DAILY) {
+    cron.schedule(
+      "0 8 * * *",
+      async () => {
+        try {
+          const channel = await client.channels.fetch(CHANNEL_DAILY);
+          if (!channel) return;
+
+          const today = new Date();
+          const events = await getEventsForDate(today);
+          const msg =
+            "🌅 **Good morning Dean!**\n\n" +
+            renderEventList(events, today, {
+              includeHeader: false,
+            });
+
+          await channel.send({
+            content: msg,
+            flags: 1 << 2, // SuppressEmbeds
+          });
+        } catch (err) {
+          console.error("Daily summary error:", err);
+        }
+      },
+      { timezone: TIMEZONE }
+    );
+  } else {
+    console.log("⚠️ CHANNEL_DAILY not set; daily summaries disabled.");
   }
 
-  // 08:00 every day
-  cron.schedule(
-    "0 8 * * *",
-    async () => {
-      try {
-        const channel = await client.channels.fetch(CHANNEL_DAILY);
-        if (!channel) {
-          console.warn("⚠️ Could not find daily channel:", CHANNEL_DAILY);
-          return;
-        }
+  // --- Weekly planning message on Sunday 20:00 ---
+  if (CHANNEL_WEEKLY) {
+    cron.schedule(
+      "0 20 * * 0",
+      async () => {
+        try {
+          const channel = await client.channels.fetch(CHANNEL_WEEKLY);
+          if (!channel) return;
 
-        const today = new Date();
-        const events = await getEventsForDate(today);
+          const today = new Date();
+          const end = new Date(today);
+          end.setDate(end.getDate() + 7);
+          const events = await getEventsForRange(today, end);
 
-        const label = today.toLocaleDateString("en-ZA", {
-          timeZone: TIMEZONE,
-        });
-
-        let msg;
-
-        if (!events.length) {
-          msg = `🌅 **Good morning Dean!**\n\nYour schedule is *wide open* today (**${label}**). 😎`;
-        } else {
-          msg = `🌅 **Good morning Dean! Here's your schedule for today (${label}):**\n\n`;
-
-          events.forEach((ev, i) => {
-            const startRaw = ev.start.dateTime || ev.start.date;
-            const endRaw = ev.end.dateTime || ev.end.date;
-
-            const startStr = new Date(startRaw).toLocaleTimeString("en-ZA", {
-              hour: "2-digit",
-              minute: "2-digit",
-              timeZone: TIMEZONE,
-            });
-
-            const endStr = new Date(endRaw).toLocaleTimeString("en-ZA", {
-              hour: "2-digit",
-              minute: "2-digit",
-              timeZone: TIMEZONE,
-            });
-
-            const location = ev.location ? ` 📍${ev.location}` : "";
-
-            msg += `${i + 1}. **${(ev.summary || "").trim()}**${location} — ${startStr} to ${endStr}\n`;
+          const header = "🧠 **Weekly planning time, Dean!**\n\n";
+          const list = renderEventList(events, null, {
+            includeHeader: false,
           });
 
-          msg += `\nLet me know if you'd like changes, cancellations, or help planning the day! 😊`;
-        }
+          const msg =
+            header +
+            (events.length
+              ? list
+              : "You don’t have much on the calendar yet. Good week to be intentional. 😎");
 
-        const sent = await channel.send(msg);
-
-        // Suppress previews in the daily summary too
-        try {
-          if (sent && typeof sent.suppressEmbeds === "function") {
-            await sent.suppressEmbeds(true);
-          }
+          await channel.send({
+            content: msg,
+            flags: 1 << 2,
+          });
         } catch (err) {
-          console.warn("Failed to suppress embeds on daily summary:", err.message || err);
+          console.error("Weekly planner error:", err);
         }
-      } catch (err) {
-        console.error("Daily summary error:", err);
-      }
-    },
-    { timezone: TIMEZONE }
-  );
-
-  console.log("⏰ Schedulers initialized (daily 08:00 summary).");
+      },
+      { timezone: TIMEZONE }
+    );
+  } else {
+    console.log("⚠️ CHANNEL_WEEKLY not set; weekly planner disabled.");
+  }
 }
 
-// ---------------------------------------------------------------------------
+// ----------------------------------------------------------
 // LOGIN
-// ---------------------------------------------------------------------------
+// ----------------------------------------------------------
 client.login(process.env.DISCORD_TOKEN);
