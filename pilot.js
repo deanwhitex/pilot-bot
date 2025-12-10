@@ -299,12 +299,15 @@ async function handleCancel(intent, originalText) {
     )} at ${formatTime(ev.start.dateTime)}.`;
   }
 
-  // --------------------------------------------------
+    // --------------------------------------------------
   // Case 2: "cancel Sergio", "cancel the Youtube Video"
   // --------------------------------------------------
   if (!target_event) {
-    // strip the word "cancel" and trim whatever is left
-    target_event = originalText.replace(/cancel/i, "").trim();
+    // remove "cancel" and common punctuation so we don't end up with "gym?"
+    target_event = originalText
+      .replace(/cancel/i, "")
+      .replace(/[?!.]/g, " ")
+      .trim();
   }
 
   if (!target_event) return "Which event should I cancel?";
