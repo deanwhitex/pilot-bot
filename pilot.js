@@ -400,33 +400,55 @@ async function handleFindFree({ date, duration }) {
 }
 
 // -----------------------------------------------
-// DAY SUMMARY
+// DAY SUMMARY (fixed so "today/tomorrow" use real dates)
 // -----------------------------------------------
 async function handleDaySummary(dateFromIntent, originalText) {
-  let date = dateFromIntent;
-
-  // if LLM didn’t give a date, try to infer "today"/"tomorrow" from text
   const lower = originalText.toLowerCase();
-  const today = new Date();
+  const now = new Date();
 
-  if (!date) {
-    if (lower.includes("tomorrow")) {
-      const d = new Date(today);
-      d.setDate(d.getDate() + 1);
-      date = d.toISOString().split("T")[0];
-    } else if (lower.includes("yesterday")) {
-      const d = new Date(today);
-      d.setDate(d.getDate() - 1);
-      date = d.toISOString().split("T")[0];
-    } else {
-      // default to today
-      date = today.toISOString().split("T")[0];
+  const isoToday = now.toISOString().split("T")[0];
+
+  const tmr = new Date(now);
+  tmr.setDate(tmr.getDate() + 1);
+  const isoTomorrow = tmr.toISOString().split("T")[0];
+
+  const yest = new Date(now);
+  yest.setDate(yest.getDate() - 1);
+  const isoYesterday = yest.toISOString().split("T")[0];
+
+  let date = dateFromIntent; // what the model guessed
+
+  // 🔒 Hard override for natural phrases – ignore the model’s date
+  if (lower.includes("today")) {
+    date = isoToday;
+  } else if (lower.includes("tomorrow")) {
+    date = isoTomorrow;
+  } else if (lower.includes("yesterday")) {
+    date = isoYesterday;
+  } else if (!date) {
+    // no date from model → default to today
+    date = isoToday;
+  }
+
+  // Extra sanity check:
+  // if the model gave a date > 1 year away and Dean didn't
+  // explicitly type a year, snap back to today.
+  try {
+    const parsed = new Date(date);
+    const diffDays = Math.abs((parsed - now) / (1000 * 60 * 60 * 24));
+    const userMentionedYear = /\b20\d{2}\b/.test(originalText);
+
+    if (diffDays > 365 && !userMentionedYear) {
+      date = isoToday;
     }
+  } catch {
+    date = isoToday;
   }
 
   const events = await getEventsForDate(date);
   return renderEventList(events, formatDate(date));
 }
+
 
 // -----------------------------------------------
 // RANGE SUMMARY
