@@ -14,9 +14,9 @@ const TIMEZONE = process.env.TZ || "Africa/Johannesburg";
 const DEFAULT_DURATION_MIN = 60;
 const MEMORY_FILE = "./memory.json";
 
-// ----------------------------------------------------------
-// LIGHTWEIGHT "MEMORY" (preferences)
-// ----------------------------------------------------------
+/* ----------------------------------------------------------
+   LIGHTWEIGHT MEMORY (preferences)
+---------------------------------------------------------- */
 let memory = {
   preferences: {
     avoid_early_mornings: true,
@@ -41,28 +41,26 @@ function saveMemory() {
   }
 }
 
-// ----------------------------------------------------------
-// OPENAI CLIENT
-// ----------------------------------------------------------
+/* ----------------------------------------------------------
+   OPENAI CLIENT
+---------------------------------------------------------- */
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// ----------------------------------------------------------
-// Simple per-user state for follow-ups
-// ----------------------------------------------------------
+/* ----------------------------------------------------------
+   SMALL SESSION STATE (for follow-ups)
+---------------------------------------------------------- */
 // modes: "cancel_select", "create_select_slot"
 const sessions = new Map(); // userId -> { mode, ... }
 
-// ----------------------------------------------------------
-// Helpers
-// ----------------------------------------------------------
+/* ----------------------------------------------------------
+   HELPERS
+---------------------------------------------------------- */
 function stripLinks(text = "") {
   return text.replace(/https?:\/\/\S+/gi, "").trim();
 }
 
 function formatDate(d) {
-  return new Date(d).toLocaleDateString("en-ZA", {
-    timeZone: TIMEZONE,
-  });
+  return new Date(d).toLocaleDateString("en-ZA", { timeZone: TIMEZONE });
 }
 
 function formatTime(d) {
@@ -73,7 +71,6 @@ function formatTime(d) {
   });
 }
 
-// Render schedule lists (also used by index.js)
 export function renderEventList(events, dateInput = null, opts = {}) {
   const { includeHeader = true } = opts;
   const label = dateInput ? formatDate(dateInput) : "this period";
@@ -102,50 +99,64 @@ export function renderEventList(events, dateInput = null, opts = {}) {
   return out;
 }
 
-// ----------------------------------------------------------
-// VERY LIGHT RULE-BASED HANDLING BEFORE LLM
-// ----------------------------------------------------------
+/* ----------------------------------------------------------
+   RULE-BASED INTENT (NO LLM) FOR EASY THINGS
+---------------------------------------------------------- */
 function isGreeting(text) {
   const lower = text.toLowerCase();
   return /^(hey|hi|hello|yo|morning|evening)\b/.test(lower);
 }
 
-function parseBasicDayRequest(text) {
+// Extract a Date object from phrases like today/tomorrow/2025-12-11
+function extractDateFromText(text) {
   const lower = text.toLowerCase();
-
-  // "schedule" or "calendar" must appear
-  if (!/(schedule|calendar|appointments?|day)/.test(lower)) return null;
-
   const now = new Date();
 
   if (/\btoday\b/.test(lower)) {
-    return { type: "day", date: now };
+    return now;
   }
 
   if (/\btomorrow\b/.test(lower)) {
     const d = new Date(now);
     d.setDate(d.getDate() + 1);
-    return { type: "day", date: d };
+    return d;
   }
 
-  // yyyy/mm/dd style
-  const m = lower.match(/(\d{4}[-/]\d{2}[-/]\d{2})/);
+  const m = lower.match(/(\d{4})[/-](\d{2})[/-](\d{2})/);
   if (m) {
-    const d = new Date(m[1]);
-    if (!isNaN(d.getTime())) {
-      return { type: "day", date: d };
-    }
+    const d = new Date(
+      Number(m[1]),
+      Number(m[2]) - 1,
+      Number(m[3]),
+      12,
+      0,
+      0,
+      0
+    );
+    if (!isNaN(d.getTime())) return d;
   }
 
   return null;
 }
 
-// ----------------------------------------------------------
-// LLM intent parser (used only when rules don't handle it)
-// ----------------------------------------------------------
+// Detect “what’s my schedule/calendar/appointments …”
+function parseBasicDayRequest(text) {
+  const lower = text.toLowerCase();
+
+  if (!/(schedule|calendar|appointments?|day)/.test(lower)) return null;
+
+  const date = extractDateFromText(text);
+  if (!date) return null;
+
+  return { type: "day", date };
+}
+
+/* ----------------------------------------------------------
+   LLM INTENT (ONLY FOR HARDER CASES)
+---------------------------------------------------------- */
 async function interpretMessageLLM(text) {
   const prompt = `
-You are Dean's scheduling assistant. Convert his message to *strict JSON*:
+You are Dean's scheduling assistant. Convert his message to strict JSON:
 
 {
   "intent": "",
@@ -157,21 +168,21 @@ You are Dean's scheduling assistant. Convert his message to *strict JSON*:
 }
 
 INTENT OPTIONS:
-- "create_event" (add/book/schedule something)
-- "cancel_event" (cancel, remove, delete something)
-- "find_free_time"
-- "assistant_chat"
+- "create_event"   (add/book/schedule something)
+- "cancel_event"   (cancel/remove/delete something)
+- "find_free_time" (ask for free time / open slots)
+- "assistant_chat" (general chat)
 - "unknown"
 
 Rules:
 - If he talks about adding/booking/scheduling -> "create_event"
 - If he says cancel/delete/remove -> "cancel_event"
-- If he says "free time", "open slot" -> "find_free_time"
+- If he says "free time", "open slot", "when can I" -> "find_free_time"
 - If it's just chat or unclear -> "assistant_chat"
-- date: ISO (YYYY-MM-DD) when possible; otherwise "".
-- start_time: 24h HH:MM when specified, otherwise "".
-- duration: minutes as number string, default "60" for events.
-- NEVER add commentary, just the JSON.
+- "date": if he says today/tomorrow, set "today" or "tomorrow" (DO NOT invent a year).
+- "start_time": 24h HH:MM if he clearly gives a time, else "".
+- "duration": minutes as string, default "60" for events.
+
 Message: "${text}"
 `;
 
@@ -189,32 +200,32 @@ Message: "${text}"
   }
 }
 
-// ----------------------------------------------------------
-// PUBLIC ENTRYPOINT
-// ----------------------------------------------------------
+/* ----------------------------------------------------------
+   PUBLIC ENTRYPOINT
+---------------------------------------------------------- */
 export async function handleUserMessage(message) {
   const userId = message.author.id;
   const text = message.content.trim();
 
-  // 1) If user is mid-flow (choosing a number for cancel/create), handle that
+  // 1) Check if user is mid-flow (choosing a number)
   const pending = sessions.get(userId);
   if (pending) {
     return await handlePendingFlow(userId, pending, text);
   }
 
-  // 2) Greetings – no LLM
+  // 2) Greetings: handled here, no LLM. (Single reply, no doubles.)
   if (isGreeting(text)) {
     return "Sure Dean — what can I help you with? 😊";
   }
 
-  // 3) Obvious schedule questions for today/tomorrow – no LLM
+  // 3) Direct “what’s my schedule for today/tomorrow/2025/12/11”
   const basicDay = parseBasicDayRequest(text);
   if (basicDay && basicDay.type === "day") {
     const events = await getEventsForDate(basicDay.date);
     return renderEventList(events, basicDay.date);
   }
 
-  // 4) Everything else -> LLM intent
+  // 4) Everything else → LLM for intent
   const intent = await interpretMessageLLM(text);
 
   switch (intent.intent) {
@@ -235,12 +246,11 @@ export async function handleUserMessage(message) {
   }
 }
 
-// ----------------------------------------------------------
-// FLOW HANDLERS (for follow-up numbers etc.)
-// ----------------------------------------------------------
+/* ----------------------------------------------------------
+   FOLLOW-UP MODES (numbers for cancel / create)
+---------------------------------------------------------- */
 async function handlePendingFlow(userId, session, text) {
   const choice = parseInt(text.trim(), 10);
-
   if (Number.isNaN(choice)) {
     return "Please reply with the **number** of the option you'd like, e.g. `1`, `2`, or `3`.";
   }
@@ -255,6 +265,7 @@ async function handlePendingFlow(userId, session, text) {
     sessions.delete(userId);
 
     await cancelEventById(ev.calendarId, ev.id);
+
     return `🗑️ Done — I cancelled **${stripLinks(
       ev.summary
     )}** on **${formatDate(ev.start.dateTime || ev.start.date)}** at **${formatTime(
@@ -284,14 +295,13 @@ async function handlePendingFlow(userId, session, text) {
     )}** from **${formatTime(slot.start)}** to **${formatTime(slot.end)}**.`;
   }
 
-  // unknown mode – clear it
   sessions.delete(userId);
   return "Let's start fresh — what would you like me to help with?";
 }
 
-// ----------------------------------------------------------
-// CREATE EVENT
-// ----------------------------------------------------------
+/* ----------------------------------------------------------
+   CREATE EVENT
+---------------------------------------------------------- */
 async function handleCreateEvent(intent, userId) {
   const title = intent.title?.trim() || "New event";
   const duration =
@@ -299,17 +309,22 @@ async function handleCreateEvent(intent, userId) {
       ? parseInt(intent.duration, 10)
       : DEFAULT_DURATION_MIN;
 
-  // If no date, ask explicitly
-  if (!intent.date) {
-    return "Which date should I schedule that on? (e.g. `2025/12/11` or `tomorrow`)";
+  // Interpret "today" / "tomorrow" here to avoid wrong years
+  let date;
+  if (intent.date === "today") {
+    date = new Date();
+  } else if (intent.date === "tomorrow") {
+    date = new Date();
+    date.setDate(date.getDate() + 1);
+  } else if (intent.date) {
+    date = extractDateFromText(intent.date);
   }
 
-  const date = new Date(intent.date);
-  if (isNaN(date.getTime())) {
-    return "I couldn't understand that date. Could you give it as `YYYY/MM/DD`?";
+  if (!date) {
+    return "Which date should I schedule that on? (e.g. `today`, `tomorrow`, or `2025/12/11`)";
   }
 
-  // If no time, suggest slots using findOpenSlots
+  // If no time, suggest slots
   if (!intent.start_time) {
     const slots = await findOpenSlots(date, duration, 3);
     if (slots.length === 0) {
@@ -334,11 +349,13 @@ async function handleCreateEvent(intent, userId) {
     return out;
   }
 
-  // Time provided → create directly
-  const start = new Date(`${intent.date}T${intent.start_time}`);
+  const start = new Date(date);
+  const [h, m] = intent.start_time.split(":").map((x) => parseInt(x, 10));
+  start.setHours(h, m || 0, 0, 0);
   if (isNaN(start.getTime())) {
     return "I couldn't parse that time. Try something like `10:00` or `14:30`.";
   }
+
   const end = new Date(start.getTime() + duration * 60 * 1000);
 
   const event = await createEvent({ title, start, end });
@@ -350,9 +367,9 @@ async function handleCreateEvent(intent, userId) {
   )}** from **${formatTime(start)}** to **${formatTime(end)}**.`;
 }
 
-// ----------------------------------------------------------
-// CANCEL EVENT
-// ----------------------------------------------------------
+/* ----------------------------------------------------------
+   CANCEL EVENT
+---------------------------------------------------------- */
 async function handleCancelEvent(intent, userId) {
   const target = intent.target_event?.trim();
   if (!target) {
@@ -360,7 +377,6 @@ async function handleCancelEvent(intent, userId) {
   }
 
   const matches = await searchEventsByText(target);
-
   if (matches.length === 0) {
     return `I couldn't find any events matching **"${target}"** in the next few weeks.`;
   }
@@ -368,6 +384,7 @@ async function handleCancelEvent(intent, userId) {
   if (matches.length === 1) {
     const ev = matches[0];
     await cancelEventById(ev.calendarId, ev.id);
+
     return `🗑️ Done — I cancelled **${stripLinks(
       ev.summary
     )}** on **${formatDate(ev.start.dateTime || ev.start.date)}** at **${formatTime(
@@ -375,7 +392,6 @@ async function handleCancelEvent(intent, userId) {
     )}**.`;
   }
 
-  // Multiple → ask for number and remember
   sessions.set(userId, {
     mode: "cancel_select",
     events: matches,
@@ -393,16 +409,22 @@ async function handleCancelEvent(intent, userId) {
   return out;
 }
 
-// ----------------------------------------------------------
-// FIND FREE TIME
-// ----------------------------------------------------------
+/* ----------------------------------------------------------
+   FIND FREE TIME
+---------------------------------------------------------- */
 async function handleFindFreeTime(intent) {
-  if (!intent.date) {
-    return "What date should I look for free time on?";
+  let date;
+  if (intent.date === "today") {
+    date = new Date();
+  } else if (intent.date === "tomorrow") {
+    date = new Date();
+    date.setDate(date.getDate() + 1);
+  } else if (intent.date) {
+    date = extractDateFromText(intent.date);
   }
-  const date = new Date(intent.date);
-  if (isNaN(date.getTime())) {
-    return "I couldn't understand that date. Please use `YYYY/MM/DD` or `tomorrow`.";
+
+  if (!date) {
+    return "What date should I look for free time on?";
   }
 
   const duration =
@@ -425,3 +447,4 @@ async function handleFindFreeTime(intent) {
   });
   return out;
 }
+
