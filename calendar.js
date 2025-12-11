@@ -1,14 +1,11 @@
 // calendar.js
 import { google } from "googleapis";
 
-// -----------------------------------------------------------------------------
-// CONFIG
-// -----------------------------------------------------------------------------
 const TIMEZONE = process.env.TZ || "Africa/Johannesburg";
-const MIN_HOUR = 8;   // earliest “human” time
-const MAX_HOUR = 22;  // latest “human” time
+const MIN_HOUR = 8;
+const MAX_HOUR = 22;
 
-// Support BOTH CALENDAR_1/2/3 and GOOGLE_CALENDAR_1/2/3
+// Support both CALENDAR_1/2/3 and GOOGLE_CALENDAR_1/2/3
 const CALENDAR_IDS = [
   process.env.CALENDAR_1 || process.env.GOOGLE_CALENDAR_1,
   process.env.CALENDAR_2 || process.env.GOOGLE_CALENDAR_2,
@@ -17,17 +14,13 @@ const CALENDAR_IDS = [
 
 if (CALENDAR_IDS.length === 0) {
   console.warn(
-    "⚠️ No calendar IDs configured. Set CALENDAR_1/2/3 or GOOGLE_CALENDAR_1/2/3 in env."
+    "⚠️ No CALENDAR_1/2/3 or GOOGLE_CALENDAR_1/2/3 set – calendar functions will return empty."
   );
 } else {
-  console.log(
-    `📅 Using ${CALENDAR_IDS.length} calendars from env (IDs not logged for safety).`
-  );
+  console.log(`📅 Using ${CALENDAR_IDS.length} calendars.`);
 }
 
-// -----------------------------------------------------------------------------
-// GOOGLE AUTH (service account)
-// -----------------------------------------------------------------------------
+// Google auth via service account
 const privateKey = process.env.GOOGLE_PRIVATE_KEY
   ? process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, "\n")
   : undefined;
@@ -41,9 +34,6 @@ const auth = new google.auth.JWT(
 
 const calendar = google.calendar({ version: "v3", auth });
 
-// -----------------------------------------------------------------------------
-// HELPERS
-// -----------------------------------------------------------------------------
 function toISO(d) {
   return new Date(d).toISOString();
 }
@@ -55,14 +45,9 @@ function sortByStart(a, b) {
   );
 }
 
-// Strip ALL http/https URLs from text so Zoom links never hit Discord
-function stripUrls(text) {
-  return text ? text.replace(/https?:\/\/\S+/g, "").trim() : "";
-}
-
-// -----------------------------------------------------------------------------
-// GET EVENTS FOR A SINGLE DAY (all 3 calendars merged)
-// -----------------------------------------------------------------------------
+/* ----------------------------------------------------------
+   GET EVENTS FOR A SINGLE DAY (all calendars merged)
+---------------------------------------------------------- */
 export async function getEventsForDate(dateInput) {
   const day = new Date(dateInput);
   const start = new Date(day);
@@ -74,9 +59,9 @@ export async function getEventsForDate(dateInput) {
   return getEventsForRange(start, end);
 }
 
-// -----------------------------------------------------------------------------
-// GET EVENTS FOR RANGE (all calendars merged)
-// -----------------------------------------------------------------------------
+/* ----------------------------------------------------------
+   GET EVENTS FOR RANGE (all calendars merged)
+---------------------------------------------------------- */
 export async function getEventsForRange(startInput, endInput) {
   if (CALENDAR_IDS.length === 0) return [];
 
@@ -95,34 +80,25 @@ export async function getEventsForRange(startInput, endInput) {
         orderBy: "startTime",
       });
 
-      if (res.data.items && res.data.items.length) {
-        // tag with calendarId so we can cancel/reschedule later
-        const tagged = res.data.items.map((e) => ({
-          ...e,
-          calendarId: calId,
-        }));
-        allEvents.push(...tagged);
-      }
+      const items = res.data.items || [];
+      const tagged = items.map((e) => ({
+        ...e,
+        calendarId: calId,
+      }));
+      allEvents.push(...tagged);
     } catch (err) {
       console.error(`Calendar list error for ${calId}:`, err.message || err);
     }
   }
 
-  // 🔧 NEW: sanitize summaries / descriptions to remove URLs (Zoom etc.)
-  allEvents = allEvents.map((e) => ({
-    ...e,
-    summary: stripUrls(e.summary),
-    description: stripUrls(e.description),
-  }));
-
   allEvents.sort(sortByStart);
   return allEvents;
 }
 
-// -----------------------------------------------------------------------------
-// FIND OPEN SLOTS BETWEEN MIN_HOUR AND MAX_HOUR
-// -----------------------------------------------------------------------------
-export async function findOpenSlots(dateInput, durationMinutes, limit = 100) {
+/* ----------------------------------------------------------
+   FIND OPEN SLOTS BETWEEN MIN_HOUR AND MAX_HOUR
+---------------------------------------------------------- */
+export async function findOpenSlots(dateInput, durationMinutes, limit = 10) {
   const durationMs = durationMinutes * 60 * 1000;
 
   const day = new Date(dateInput);
@@ -167,9 +143,9 @@ export async function findOpenSlots(dateInput, durationMinutes, limit = 100) {
   return free.slice(0, limit);
 }
 
-// -----------------------------------------------------------------------------
-// CREATE EVENT (always primary / first calendar) – with logging
-// -----------------------------------------------------------------------------
+/* ----------------------------------------------------------
+   CREATE EVENT (first calendar is "primary")
+---------------------------------------------------------- */
 export async function createEvent({ title, start, end, description, location }) {
   if (CALENDAR_IDS.length === 0) {
     throw new Error("No calendars configured for createEvent");
@@ -177,47 +153,30 @@ export async function createEvent({ title, start, end, description, location }) 
 
   const primaryId = CALENDAR_IDS[0];
 
-  try {
-    const res = await calendar.events.insert({
-      calendarId: primaryId,
-      requestBody: {
-        summary: title,
-        description: description || "",
-        location: location || undefined,
-        start: {
-          dateTime: start.toISOString(),
-          timeZone: TIMEZONE,
-        },
-        end: {
-          dateTime: end.toISOString(),
-          timeZone: TIMEZONE,
-        },
+  const res = await calendar.events.insert({
+    calendarId: primaryId,
+    requestBody: {
+      summary: title,
+      description: description || "",
+      location: location || undefined,
+      start: {
+        dateTime: start.toISOString(),
+        timeZone: TIMEZONE,
       },
-    });
+      end: {
+        dateTime: end.toISOString(),
+        timeZone: TIMEZONE,
+      },
+    },
+  });
 
-    const ev = res.data;
-    console.log(
-      "✅ createEvent ok:",
-      ev.id,
-      "on",
-      primaryId,
-      "at",
-      ev.start?.dateTime
-    );
-    return { ...ev, calendarId: primaryId };
-  } catch (err) {
-    console.error(
-      "❌ createEvent error:",
-      err?.response?.data || err.message || err
-    );
-    throw err;
-  }
+  const ev = res.data;
+  return { ...ev, calendarId: primaryId };
 }
 
-// -----------------------------------------------------------------------------
-// CANCEL EVENT BY ID
-// (calendarId is required – we store it on each event object)
-// -----------------------------------------------------------------------------
+/* ----------------------------------------------------------
+   CANCEL EVENT BY ID
+---------------------------------------------------------- */
 export async function cancelEventById(calendarId, eventId) {
   if (!calendarId || !eventId) {
     throw new Error("cancelEventById requires calendarId and eventId");
@@ -229,9 +188,9 @@ export async function cancelEventById(calendarId, eventId) {
   });
 }
 
-// -----------------------------------------------------------------------------
-// RESCHEDULE EVENT BY ID
-// -----------------------------------------------------------------------------
+/* ----------------------------------------------------------
+   RESCHEDULE EVENT BY ID (unused right now but kept)
+---------------------------------------------------------- */
 export async function rescheduleEventById(
   calendarId,
   eventId,
@@ -258,9 +217,9 @@ export async function rescheduleEventById(
   });
 }
 
-// -----------------------------------------------------------------------------
-// SEARCH EVENTS BY TEXT (for cancel / reschedule flows) – fuzzy + punctuation-safe
-// -----------------------------------------------------------------------------
+/* ----------------------------------------------------------
+   SEARCH EVENTS BY TEXT (for cancel flows)
+---------------------------------------------------------- */
 export async function searchEventsByText(
   searchText,
   daysBack = 7,
@@ -277,64 +236,12 @@ export async function searchEventsByText(
 
   const events = await getEventsForRange(start, end);
 
-  // Normalise text: lowercase, remove most punctuation, condense spaces
-  const normalize = (str = "") =>
-    str
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, " ")
-      .replace(/\s+/g, " ")
-      .trim();
-
-  const normalizedSearch = normalize(searchText);
-  if (!normalizedSearch) return [];
-
-  const stopwords = new Set([
-    "the",
-    "a",
-    "an",
-    "to",
-    "for",
-    "with",
-    "my",
-    "me",
-    "please",
-    "call",
-    "meeting",
-    "appointment",
-    "slot",
-    "event",
-    "cancel",
-    "move",
-    "reschedule",
-    "book",
-    "schedule",
-    "can",
-    "you",
-    "on",
-    "at",
-    "tomorrow",
-    "today",
-  ]);
-
-  const searchTokens = normalizedSearch
-    .split(" ")
-    .filter((t) => t && !stopwords.has(t));
-
+  const lower = searchText.toLowerCase();
   return events.filter((e) => {
-    const raw = `${e.summary || ""} ${e.description || ""}`;
-    const text = normalize(raw); // "gym", "record youtube video", etc.
-
-    // 1) direct substring match on the normalised phrase
-    if (text.includes(normalizedSearch)) return true;
-
-    if (searchTokens.length === 0) return false;
-
-    // 2) token-based fuzzy match:
-    //    "can you cancel gym?" → ["gym"]
-    return searchTokens.every((tok) => text.includes(tok));
+    const text = `${e.summary || ""} ${e.description || ""}`.toLowerCase();
+    return text.includes(lower);
   });
 }
-
 
 
 
