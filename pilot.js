@@ -47,10 +47,12 @@ function saveMemory() {
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 /* ----------------------------------------------------------
-   SMALL SESSION STATE (for follow-ups)
+   SESSION STATE
+   - sessions: temporary flows (pick a number)
+   - lastSchedules: last schedule Dean asked for per user
 ---------------------------------------------------------- */
-// modes: "cancel_select", "create_select_slot"
 const sessions = new Map(); // userId -> { mode, ... }
+const lastSchedules = new Map(); // userId -> { date: Date, events: [] }
 
 /* ----------------------------------------------------------
    HELPERS
@@ -139,11 +141,12 @@ function extractDateFromText(text) {
   return null;
 }
 
-// Detect “what’s my schedule/calendar/appointments …”
+// Detect “what’s my schedule/calendar/appointments/day …”
 function parseBasicDayRequest(text) {
   const lower = text.toLowerCase();
 
-  if (!/(schedule|calendar|appointments?|day)/.test(lower)) return null;
+  // IMPORTANT: require whole word "day" so "today" doesn't trigger this
+  if (!/\b(schedule|calendar|appointments?|day)\b/.test(lower)) return null;
 
   const date = extractDateFromText(text);
   if (!date) return null;
@@ -182,6 +185,7 @@ Rules:
 - "date": if he says today/tomorrow, set "today" or "tomorrow" (DO NOT invent a year).
 - "start_time": 24h HH:MM if he clearly gives a time, else "".
 - "duration": minutes as string, default "60" for events.
+- "target_event": the thing he wants to cancel (e.g. "Muay Thai", "gym").
 
 Message: "${text}"
 `;
@@ -218,10 +222,11 @@ export async function handleUserMessage(message) {
     return "Sure Dean — what can I help you with? 😊";
   }
 
-  // 3) Direct “what’s my schedule for today/tomorrow/2025/12/11”
+  // 3) Direct “what’s my schedule/calendar/appointments/day …”
   const basicDay = parseBasicDayRequest(text);
   if (basicDay && basicDay.type === "day") {
     const events = await getEventsForDate(basicDay.date);
+    lastSchedules.set(userId, { date: basicDay.date, events });
     return renderEventList(events, basicDay.date);
   }
 
@@ -233,10 +238,10 @@ export async function handleUserMessage(message) {
       return await handleCreateEvent(intent, userId);
 
     case "cancel_event":
-      return await handleCancelEvent(intent, userId);
+      return await handleCancelEvent(intent, userId, text);
 
     case "find_free_time":
-      return await handleFindFreeTime(intent);
+      return await handleFindFreeTime(intent, userId);
 
     case "assistant_chat":
       return "Sure Dean — what can I help you with? 😊";
@@ -300,7 +305,7 @@ async function handlePendingFlow(userId, session, text) {
 }
 
 /* ----------------------------------------------------------
-   CREATE EVENT
+   CREATE EVENT — remembers last schedule's day
 ---------------------------------------------------------- */
 async function handleCreateEvent(intent, userId) {
   const title = intent.title?.trim() || "New event";
@@ -309,8 +314,9 @@ async function handleCreateEvent(intent, userId) {
       ? parseInt(intent.duration, 10)
       : DEFAULT_DURATION_MIN;
 
-  // Interpret "today" / "tomorrow" here to avoid wrong years
   let date;
+
+  // 1) Interpret textual date from LLM
   if (intent.date === "today") {
     date = new Date();
   } else if (intent.date === "tomorrow") {
@@ -318,6 +324,14 @@ async function handleCreateEvent(intent, userId) {
     date.setDate(date.getDate() + 1);
   } else if (intent.date) {
     date = extractDateFromText(intent.date);
+  }
+
+  // 2) If LLM gave no date, fall back to last schedule Dean asked for
+  if (!date) {
+    const last = lastSchedules.get(userId);
+    if (last && last.date) {
+      date = new Date(last.date);
+    }
   }
 
   if (!date) {
@@ -368,12 +382,70 @@ async function handleCreateEvent(intent, userId) {
 }
 
 /* ----------------------------------------------------------
-   CANCEL EVENT
+   CANCEL EVENT — uses last schedule + numbers
 ---------------------------------------------------------- */
-async function handleCancelEvent(intent, userId) {
+async function handleCancelEvent(intent, userId, rawText) {
   const target = intent.target_event?.trim();
+  const last = lastSchedules.get(userId);
+
+  // 1) If we have a last schedule and they say "cancel 2", use index
+  if (last && last.events && last.events.length > 0) {
+    const numMatch = rawText.match(/\b(\d+)\b/);
+    if (numMatch) {
+      const idx = parseInt(numMatch[1], 10) - 1;
+      if (idx >= 0 && idx < last.events.length) {
+        const ev = last.events[idx];
+        await cancelEventById(ev.calendarId, ev.id);
+        return `🗑️ Done — I cancelled **${stripLinks(
+          ev.summary
+        )}** on **${formatDate(ev.start.dateTime || ev.start.date)}** at **${formatTime(
+          ev.start.dateTime || ev.start.date
+        )}**.`;
+      }
+    }
+  }
+
+  // 2) If we have a target name (e.g. "muay thai") and last schedule, try that first
+  if (last && last.events && last.events.length > 0 && target) {
+    const lower = target.toLowerCase();
+    const matches = last.events.filter((e) =>
+      `${e.summary || ""} ${e.description || ""}`
+        .toLowerCase()
+        .includes(lower)
+    );
+
+    if (matches.length === 1) {
+      const ev = matches[0];
+      await cancelEventById(ev.calendarId, ev.id);
+      return `🗑️ Done — I cancelled **${stripLinks(
+        ev.summary
+      )}** on **${formatDate(
+        ev.start.dateTime || ev.start.date
+      )}** at **${formatTime(ev.start.dateTime || ev.start.date)}**.`;
+    }
+
+    if (matches.length > 1) {
+      sessions.set(userId, {
+        mode: "cancel_select",
+        events: matches,
+      });
+
+      let out = `I found several events that might match **"${target}"**. Which one should I cancel?\n\n`;
+      matches.forEach((ev, i) => {
+        out += `${i + 1}. **${stripLinks(
+          ev.summary
+        )}** — ${formatDate(
+          ev.start.dateTime || ev.start.date
+        )} at ${formatTime(ev.start.dateTime || ev.start.date)}\n`;
+      });
+      out += `\nReply with the **number** of the one you want me to cancel.`;
+      return out;
+    }
+  }
+
+  // 3) Fall back to global search if we still don't know
   if (!target) {
-    return "Which event should I cancel? You can say something like `cancel gym tomorrow`.";
+    return "Which event should I cancel? You can say something like `cancel Muay Thai today` or `cancel 2`.";
   }
 
   const matches = await searchEventsByText(target);
@@ -401,19 +473,20 @@ async function handleCancelEvent(intent, userId) {
   matches.forEach((ev, i) => {
     out += `${i + 1}. **${stripLinks(
       ev.summary
-    )}** — ${formatDate(ev.start.dateTime || ev.start.date)} at ${formatTime(
+    )}** — ${formatDate(
       ev.start.dateTime || ev.start.date
-    )}\n`;
+    )} at ${formatTime(ev.start.dateTime || ev.start.date)}\n`;
   });
   out += `\nReply with the **number** of the one you want me to cancel.`;
   return out;
 }
 
 /* ----------------------------------------------------------
-   FIND FREE TIME
+   FIND FREE TIME — uses last schedule date if no date
 ---------------------------------------------------------- */
-async function handleFindFreeTime(intent) {
+async function handleFindFreeTime(intent, userId) {
   let date;
+
   if (intent.date === "today") {
     date = new Date();
   } else if (intent.date === "tomorrow") {
@@ -421,6 +494,13 @@ async function handleFindFreeTime(intent) {
     date.setDate(date.getDate() + 1);
   } else if (intent.date) {
     date = extractDateFromText(intent.date);
+  }
+
+  if (!date) {
+    const last = lastSchedules.get(userId);
+    if (last && last.date) {
+      date = new Date(last.date);
+    }
   }
 
   if (!date) {
@@ -447,4 +527,3 @@ async function handleFindFreeTime(intent) {
   });
   return out;
 }
-
