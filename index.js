@@ -7,14 +7,14 @@ import { getEventsForDate, getEventsForRange } from "./calendar.js";
 
 const TIMEZONE = process.env.TZ || "Africa/Johannesburg";
 
-// Channel IDs (from Render env)
+// Discord channel IDs (from Render env)
 const CHANNEL_GENERAL = process.env.CHANNEL_GENERAL;
 const CHANNEL_DAILY = process.env.CHANNEL_DAILY;
 const CHANNEL_WEEKLY = process.env.CHANNEL_WEEKLY;
 
-// ----------------------------------------------------------
-// DISCORD CLIENT
-// ----------------------------------------------------------
+/* ----------------------------------------------------------
+   DISCORD CLIENT
+---------------------------------------------------------- */
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -28,34 +28,30 @@ client.once("ready", () => {
   initSchedulers();
 });
 
-// ----------------------------------------------------------
-// SINGLE MESSAGE HANDLER (no duplicates)
-// ----------------------------------------------------------
+/* ----------------------------------------------------------
+   SINGLE MESSAGE HANDLER (NO DOUBLE REPLIES)
+---------------------------------------------------------- */
 client.on("messageCreate", async (message) => {
   try {
-    // 1) Never reply to ourselves
+    // 1. Never reply to ourselves
     if (message.author.bot) return;
 
-    // 2) Optionally restrict to calendar channels only
-    const allowedChannels = new Set(
+    // 2. Only respond in the calendar channels
+    const allowed = new Set(
       [CHANNEL_GENERAL, CHANNEL_DAILY, CHANNEL_WEEKLY].filter(Boolean)
     );
-    if (allowedChannels.size && !allowedChannels.has(message.channelId)) {
-      // Ignore messages in other channels
-      return;
-    }
+    if (allowed.size && !allowed.has(message.channelId)) return;
 
-    // 3) Ask pilot.js what to say
+    // 3. Ask pilot.js what to say
     const replyText = await handleUserMessage(message);
 
-    // If pilot.js returns null/empty, don't reply
+    // If pilot.js says "nothing", don't reply
     if (!replyText) return;
 
-    // 4) Exactly ONE reply per message
+    // 4. Exactly ONE reply per message
     await message.reply({
       content: replyText,
-      // Suppress link previews by default
-      flags: 1 << 2, // SuppressEmbeds bit
+      flags: 1 << 2, // SuppressEmbeds (no Zoom link previews)
     });
   } catch (err) {
     console.error("messageCreate error:", err);
@@ -64,18 +60,18 @@ client.on("messageCreate", async (message) => {
         "Sorry Dean, something went wrong while I was processing that. 😕"
       );
     } catch {
-      /* ignore */
+      // ignore
     }
   }
 });
 
-// ----------------------------------------------------------
-// SCHEDULERS (Daily & Weekly)
-// ----------------------------------------------------------
+/* ----------------------------------------------------------
+   SCHEDULERS (Daily 08:00 + Weekly Sunday 20:00)
+---------------------------------------------------------- */
 function initSchedulers() {
   console.log("⏰ Schedulers initialized.");
 
-  // --- Daily schedule for TODAY at 08:00 local time ---
+  // --- Daily schedule for TODAY at 08:00 ---
   if (CHANNEL_DAILY) {
     cron.schedule(
       "0 8 * * *",
@@ -86,15 +82,14 @@ function initSchedulers() {
 
           const today = new Date();
           const events = await getEventsForDate(today);
+
           const msg =
-            "🌅 **Good morning Dean!**\n\n" +
-            renderEventList(events, today, {
-              includeHeader: false,
-            });
+            "🌅 **Good morning Dean! Here's your schedule for today:**\n\n" +
+            renderEventList(events, today, { includeHeader: false });
 
           await channel.send({
             content: msg,
-            flags: 1 << 2, // SuppressEmbeds
+            flags: 1 << 2,
           });
         } catch (err) {
           console.error("Daily summary error:", err);
@@ -106,7 +101,7 @@ function initSchedulers() {
     console.log("⚠️ CHANNEL_DAILY not set; daily summaries disabled.");
   }
 
-  // --- Weekly planning message on Sunday 20:00 ---
+  // --- Weekly planning on Sunday 20:00 ---
   if (CHANNEL_WEEKLY) {
     cron.schedule(
       "0 20 * * 0",
@@ -118,12 +113,11 @@ function initSchedulers() {
           const today = new Date();
           const end = new Date(today);
           end.setDate(end.getDate() + 7);
+
           const events = await getEventsForRange(today, end);
 
           const header = "🧠 **Weekly planning time, Dean!**\n\n";
-          const list = renderEventList(events, null, {
-            includeHeader: false,
-          });
+          const list = renderEventList(events, null, { includeHeader: false });
 
           const msg =
             header +
@@ -146,7 +140,8 @@ function initSchedulers() {
   }
 }
 
-// ----------------------------------------------------------
-// LOGIN
-// ----------------------------------------------------------
+/* ----------------------------------------------------------
+   LOGIN
+---------------------------------------------------------- */
 client.login(process.env.DISCORD_TOKEN);
+
