@@ -1,5 +1,4 @@
 // pilot.js
-import OpenAI from "openai";
 import fs from "fs";
 import {
   getEventsForDate,
@@ -42,16 +41,11 @@ function saveMemory() {
 }
 
 /* ----------------------------------------------------------
-   OPENAI CLIENT
----------------------------------------------------------- */
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-
-/* ----------------------------------------------------------
    SESSION STATE
-   - sessions: temporary flows (pick a number)
-   - lastSchedules: last schedule Dean asked for per user
+   - sessions: temporary flows (pick-a-number)
+   - lastSchedules: last schedule per user for cancel/add
 ---------------------------------------------------------- */
-const sessions = new Map(); // userId -> { mode, ... }
+const sessions = new Map();      // userId -> { mode, ... }
 const lastSchedules = new Map(); // userId -> { date: Date, events: [] }
 
 /* ----------------------------------------------------------
@@ -71,6 +65,53 @@ function formatTime(d) {
     hour: "2-digit",
     minute: "2-digit",
   });
+}
+
+function extractDateFromText(text) {
+  const lower = text.toLowerCase();
+  const now = new Date();
+
+  if (/\btoday\b/.test(lower)) return now;
+
+  if (/\btomorrow\b/.test(lower)) {
+    const d = new Date(now);
+    d.setDate(d.getDate() + 1);
+    return d;
+  }
+
+  const m = lower.match(/(\d{4})[/-](\d{2})[/-](\d{2})/);
+  if (m) {
+    const d = new Date(
+      Number(m[1]),
+      Number(m[2]) - 1,
+      Number(m[3]),
+      12,
+      0,
+      0,
+      0
+    );
+    if (!isNaN(d.getTime())) return d;
+  }
+
+  return null;
+}
+
+function parseTimeFromText(text) {
+  // 10am, 10:30am, 14:00, 4 pm, etc.
+  const m = text.match(/(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/i);
+  if (!m) return "";
+
+  let hour = parseInt(m[1], 10);
+  let minute = m[2] ? parseInt(m[2], 10) : 0;
+  const ampm = m[3] ? m[3].toLowerCase() : null;
+
+  if (ampm === "pm" && hour < 12) hour += 12;
+  if (ampm === "am" && hour === 12) hour = 0;
+
+  if (hour < 0 || hour > 23) return "";
+  return `${hour.toString().padStart(2, "0")}:${minute
+    .toString()
+    .padStart(2, "0")}`;
 }
 
 export function renderEventList(events, dateInput = null, opts = {}) {
@@ -101,51 +142,19 @@ export function renderEventList(events, dateInput = null, opts = {}) {
   return out;
 }
 
-/* ----------------------------------------------------------
-   RULE-BASED INTENT (NO LLM) FOR EASY THINGS
----------------------------------------------------------- */
 function isGreeting(text) {
   const lower = text.toLowerCase();
   return /^(hey|hi|hello|yo|morning|evening)\b/.test(lower);
 }
 
-// Extract a Date object from phrases like today/tomorrow/2025-12-11
-function extractDateFromText(text) {
-  const lower = text.toLowerCase();
-  const now = new Date();
+/* ----------------------------------------------------------
+   PARSERS (no AI, just rules)
+---------------------------------------------------------- */
 
-  if (/\btoday\b/.test(lower)) {
-    return now;
-  }
-
-  if (/\btomorrow\b/.test(lower)) {
-    const d = new Date(now);
-    d.setDate(d.getDate() + 1);
-    return d;
-  }
-
-  const m = lower.match(/(\d{4})[/-](\d{2})[/-](\d{2})/);
-  if (m) {
-    const d = new Date(
-      Number(m[1]),
-      Number(m[2]) - 1,
-      Number(m[3]),
-      12,
-      0,
-      0,
-      0
-    );
-    if (!isNaN(d.getTime())) return d;
-  }
-
-  return null;
-}
-
-// Detect “what’s my schedule/calendar/appointments/day …”
+// “what’s my schedule/calendar/appointments/day …”
 function parseBasicDayRequest(text) {
   const lower = text.toLowerCase();
 
-  // IMPORTANT: require whole word "day" so "today" doesn't trigger this
   if (!/\b(schedule|calendar|appointments?|day)\b/.test(lower)) return null;
 
   const date = extractDateFromText(text);
@@ -154,54 +163,85 @@ function parseBasicDayRequest(text) {
   return { type: "day", date };
 }
 
-/* ----------------------------------------------------------
-   LLM INTENT (ONLY FOR HARDER CASES)
----------------------------------------------------------- */
-async function interpretMessageLLM(text) {
-  const prompt = `
-You are Dean's scheduling assistant. Convert his message to strict JSON:
+// “cancel muay”, “can you cancel 2”, “cancel muay for today”
+function parseCancelCommand(text) {
+  const lower = text.toLowerCase();
+  const cancelIdx = lower.indexOf("cancel");
 
-{
-  "intent": "",
-  "title": "",
-  "date": "",
-  "start_time": "",
-  "duration": "",
-  "target_event": ""
+  if (cancelIdx === -1) return null;
+
+  // If they say "cancel 2" etc, we let the handler use the number
+  const numAfter = lower.match(/\bcancel\s+(\d+)\b/);
+  let targetEvent = null;
+
+  if (!numAfter) {
+    let rest = text.slice(cancelIdx + "cancel".length);
+
+    // Strip common filler words / date / time phrases
+    rest = rest.replace(/\b(today|tomorrow|please|for|the|event|appointment|my|on|at)\b/gi, " ");
+    rest = rest.replace(/\d{4}[/-]\d{2}[/-]\d{2}/g, " ");
+    rest = rest.replace(/\d{1,2}(:\d{2})?\s*(am|pm)?/gi, " ");
+
+    targetEvent = rest.trim();
+    if (!targetEvent) targetEvent = null;
+  }
+
+  return { target_event: targetEvent };
 }
 
-INTENT OPTIONS:
-- "create_event"   (add/book/schedule something)
-- "cancel_event"   (cancel/remove/delete something)
-- "find_free_time" (ask for free time / open slots)
-- "assistant_chat" (general chat)
-- "unknown"
+// “book gym”, “add gym for 10am tomorrow”, “schedule Zoom with John”
+function parseCreateCommand(text) {
+  const lower = text.toLowerCase();
+  const m = lower.match(/\b(add|book|schedule|put|block)\b/);
+  if (!m) return null;
 
-Rules:
-- If he talks about adding/booking/scheduling -> "create_event"
-- If he says cancel/delete/remove -> "cancel_event"
-- If he says "free time", "open slot", "when can I" -> "find_free_time"
-- If it's just chat or unclear -> "assistant_chat"
-- "date": if he says today/tomorrow, set "today" or "tomorrow" (DO NOT invent a year).
-- "start_time": 24h HH:MM if he clearly gives a time, else "".
-- "duration": minutes as string, default "60" for events.
-- "target_event": the thing he wants to cancel (e.g. "Muay Thai", "gym").
+  let rest = text.slice(m.index + m[0].length).trim();
 
-Message: "${text}"
-`;
-
-  const completion = await openai.chat.completions.create({
-    model: "gpt-4o-mini",
-    messages: [{ role: "user", content: prompt }],
-    temperature: 0,
-  });
-
-  try {
-    return JSON.parse(completion.choices[0].message.content);
-  } catch (err) {
-    console.error("interpretMessageLLM JSON error:", err);
-    return { intent: "unknown" };
+  let dateStr = null;
+  const rl = rest.toLowerCase();
+  if (/\btoday\b/.test(rl)) dateStr = "today";
+  else if (/\btomorrow\b/.test(rl)) dateStr = "tomorrow";
+  else {
+    const dm = rl.match(/(\d{4}[/-]\d{2}[/-]\d{2})/);
+    if (dm) dateStr = dm[1];
   }
+
+  const start_time = parseTimeFromText(rest);
+
+  // Clean to get the title
+  rest = rest.replace(/\b(today|tomorrow|on|at|for|please|my)\b/gi, " ");
+  rest = rest.replace(/\d{4}[/-]\d{2}[/-]\d{2}/g, " ");
+  rest = rest.replace(/\d{1,2}(:\d{2})?\s*(am|pm)?/gi, " ");
+
+  const title = rest.trim() || "New event";
+
+  return { title, date: dateStr, start_time };
+}
+
+// “when am I free”, “free time tomorrow”, “open slot on Friday”
+function parseFreeCommand(text) {
+  const lower = text.toLowerCase();
+  if (
+    !(
+      /free time/.test(lower) ||
+      /free slot/.test(lower) ||
+      /open slot/.test(lower) ||
+      /when am i free/.test(lower) ||
+      /when can i/.test(lower)
+    )
+  ) {
+    return null;
+  }
+
+  const date = extractDateFromText(text);
+  let duration = DEFAULT_DURATION_MIN;
+
+  const dm = lower.match(/(\d+)\s*(min|mins|minutes)/);
+  if (dm) {
+    duration = parseInt(dm[1], 10);
+  }
+
+  return { date, duration };
 }
 
 /* ----------------------------------------------------------
@@ -211,18 +251,18 @@ export async function handleUserMessage(message) {
   const userId = message.author.id;
   const text = message.content.trim();
 
-  // 1) Check if user is mid-flow (choosing a number)
+  // 1) If we're in a “choose number” flow
   const pending = sessions.get(userId);
   if (pending) {
     return await handlePendingFlow(userId, pending, text);
   }
 
-  // 2) Greetings: handled here, no LLM. (Single reply, no doubles.)
+  // 2) Greetings
   if (isGreeting(text)) {
     return "Sure Dean — what can I help you with? 😊";
   }
 
-  // 3) Direct “what’s my schedule/calendar/appointments/day …”
+  // 3) Direct schedule request
   const basicDay = parseBasicDayRequest(text);
   if (basicDay && basicDay.type === "day") {
     const events = await getEventsForDate(basicDay.date);
@@ -230,29 +270,30 @@ export async function handleUserMessage(message) {
     return renderEventList(events, basicDay.date);
   }
 
-  // 4) Everything else → LLM for intent
-  const intent = await interpretMessageLLM(text);
-
-  switch (intent.intent) {
-    case "create_event":
-      return await handleCreateEvent(intent, userId);
-
-    case "cancel_event":
-      return await handleCancelEvent(intent, userId, text);
-
-    case "find_free_time":
-      return await handleFindFreeTime(intent, userId);
-
-    case "assistant_chat":
-      return "Sure Dean — what can I help you with? 😊";
-
-    default:
-      return "I'm not entirely sure what you mean, but I'm here to help. 😊";
+  // 4) Cancel command
+  const cancelParsed = parseCancelCommand(text);
+  if (cancelParsed) {
+    return await handleCancelCommand(cancelParsed, userId, text);
   }
+
+  // 5) Create command
+  const createParsed = parseCreateCommand(text);
+  if (createParsed) {
+    return await handleCreateCommand(createParsed, userId);
+  }
+
+  // 6) Free time command
+  const freeParsed = parseFreeCommand(text);
+  if (freeParsed) {
+    return await handleFreeCommand(freeParsed, userId);
+  }
+
+  // 7) Default
+  return "I'm not entirely sure what you mean, but I'm here to help. 😊";
 }
 
 /* ----------------------------------------------------------
-   FOLLOW-UP MODES (numbers for cancel / create)
+   FOLLOW-UP FLOWS (number selections)
 ---------------------------------------------------------- */
 async function handlePendingFlow(userId, session, text) {
   const choice = parseInt(text.trim(), 10);
@@ -305,28 +346,22 @@ async function handlePendingFlow(userId, session, text) {
 }
 
 /* ----------------------------------------------------------
-   CREATE EVENT — remembers last schedule's day
+   CREATE EVENT (from parsed command)
 ---------------------------------------------------------- */
-async function handleCreateEvent(intent, userId) {
-  const title = intent.title?.trim() || "New event";
-  const duration =
-    intent.duration && !isNaN(parseInt(intent.duration, 10))
-      ? parseInt(intent.duration, 10)
-      : DEFAULT_DURATION_MIN;
+async function handleCreateCommand(parsed, userId) {
+  const { title, date: dateStr, start_time } = parsed;
+  let date = null;
 
-  let date;
-
-  // 1) Interpret textual date from LLM
-  if (intent.date === "today") {
+  if (dateStr === "today") {
     date = new Date();
-  } else if (intent.date === "tomorrow") {
+  } else if (dateStr === "tomorrow") {
     date = new Date();
     date.setDate(date.getDate() + 1);
-  } else if (intent.date) {
-    date = extractDateFromText(intent.date);
+  } else if (dateStr) {
+    date = extractDateFromText(dateStr);
   }
 
-  // 2) If LLM gave no date, fall back to last schedule Dean asked for
+  // no date given → fall back to last schedule Dean asked for
   if (!date) {
     const last = lastSchedules.get(userId);
     if (last && last.date) {
@@ -338,8 +373,10 @@ async function handleCreateEvent(intent, userId) {
     return "Which date should I schedule that on? (e.g. `today`, `tomorrow`, or `2025/12/11`)";
   }
 
-  // If no time, suggest slots
-  if (!intent.start_time) {
+  const duration = DEFAULT_DURATION_MIN;
+
+  // If no start time → suggest slots
+  if (!start_time) {
     const slots = await findOpenSlots(date, duration, 3);
     if (slots.length === 0) {
       return `I couldn't find any good ${duration}-minute slots on **${formatDate(
@@ -364,14 +401,13 @@ async function handleCreateEvent(intent, userId) {
   }
 
   const start = new Date(date);
-  const [h, m] = intent.start_time.split(":").map((x) => parseInt(x, 10));
+  const [h, m] = start_time.split(":").map((x) => parseInt(x, 10));
   start.setHours(h, m || 0, 0, 0);
   if (isNaN(start.getTime())) {
     return "I couldn't parse that time. Try something like `10:00` or `14:30`.";
   }
 
   const end = new Date(start.getTime() + duration * 60 * 1000);
-
   const event = await createEvent({ title, start, end });
 
   return `🎉 All set! I added **${stripLinks(
@@ -382,15 +418,15 @@ async function handleCreateEvent(intent, userId) {
 }
 
 /* ----------------------------------------------------------
-   CANCEL EVENT — uses last schedule + numbers
+   CANCEL EVENT (from parsed command + last schedule)
 ---------------------------------------------------------- */
-async function handleCancelEvent(intent, userId, rawText) {
-  const target = intent.target_event?.trim();
+async function handleCancelCommand(parsed, userId, rawText) {
+  const target = parsed.target_event ? parsed.target_event.trim() : null;
   const last = lastSchedules.get(userId);
 
-  // 1) If we have a last schedule and they say "cancel 2", use index
+  // 1) If we have a last schedule and they say "cancel 2"
   if (last && last.events && last.events.length > 0) {
-    const numMatch = rawText.match(/\b(\d+)\b/);
+    const numMatch = rawText.toLowerCase().match(/\bcancel\s+(\d+)\b/);
     if (numMatch) {
       const idx = parseInt(numMatch[1], 10) - 1;
       if (idx >= 0 && idx < last.events.length) {
@@ -398,14 +434,14 @@ async function handleCancelEvent(intent, userId, rawText) {
         await cancelEventById(ev.calendarId, ev.id);
         return `🗑️ Done — I cancelled **${stripLinks(
           ev.summary
-        )}** on **${formatDate(ev.start.dateTime || ev.start.date)}** at **${formatTime(
+        )}** on **${formatDate(
           ev.start.dateTime || ev.start.date
-        )}**.`;
+        )}** at **${formatTime(ev.start.dateTime || ev.start.date)}**.`;
       }
     }
   }
 
-  // 2) If we have a target name (e.g. "muay thai") and last schedule, try that first
+  // 2) Use last schedule to find by name (“cancel muay”)
   if (last && last.events && last.events.length > 0 && target) {
     const lower = target.toLowerCase();
     const matches = last.events.filter((e) =>
@@ -443,7 +479,7 @@ async function handleCancelEvent(intent, userId, rawText) {
     }
   }
 
-  // 3) Fall back to global search if we still don't know
+  // 3) Fallback: global search
   if (!target) {
     return "Which event should I cancel? You can say something like `cancel Muay Thai today` or `cancel 2`.";
   }
@@ -482,19 +518,10 @@ async function handleCancelEvent(intent, userId, rawText) {
 }
 
 /* ----------------------------------------------------------
-   FIND FREE TIME — uses last schedule date if no date
+   FREE TIME
 ---------------------------------------------------------- */
-async function handleFindFreeTime(intent, userId) {
-  let date;
-
-  if (intent.date === "today") {
-    date = new Date();
-  } else if (intent.date === "tomorrow") {
-    date = new Date();
-    date.setDate(date.getDate() + 1);
-  } else if (intent.date) {
-    date = extractDateFromText(intent.date);
-  }
+async function handleFreeCommand(parsed, userId) {
+  let { date, duration } = parsed;
 
   if (!date) {
     const last = lastSchedules.get(userId);
@@ -507,10 +534,7 @@ async function handleFindFreeTime(intent, userId) {
     return "What date should I look for free time on?";
   }
 
-  const duration =
-    intent.duration && !isNaN(parseInt(intent.duration, 10))
-      ? parseInt(intent.duration, 10)
-      : DEFAULT_DURATION_MIN;
+  duration = duration || DEFAULT_DURATION_MIN;
 
   const slots = await findOpenSlots(date, duration);
   if (slots.length === 0) {
